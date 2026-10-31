@@ -173,7 +173,7 @@ async function main() {
 		await $({
 			stdio: "inherit",
 			cwd: repoRoot,
-		})`pnpm build -F rivetkit -F @rivetkit/* -F !@rivetkit/shared-data -F !@rivetkit/engine-frontend -F !@rivetkit/rivetkit-napi -F !@rivetkit/rivetkit-wasm`;
+		})`pnpm build -F rivetkit -F @rivetkit/* -F !@rivetkit/shared-data -F !@rivetkit/rivetkit-napi -F !@rivetkit/rivetkit-wasm`;
 		await $({
 			stdio: "inherit",
 			cwd: repoRoot,
