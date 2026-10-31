@@ -86,6 +86,7 @@ pub(crate) async fn prepare(
 					std::ops::Bound::Included(key.clone()),
 				),
 				1,
+				crate::filesystem::filter::sst_filters(),
 			)
 			.await?;
 		ensure!(

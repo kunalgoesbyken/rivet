@@ -177,6 +177,16 @@ pub async fn handle_commands(ctx: &mut EnvoyContext, commands: Vec<protocol::Com
 
 		match command_wrapper.inner {
 			protocol::Command::CommandStartActor(val) => {
+				if ctx.shutdown.is_draining() {
+					report_unhosted_generation_stopped(
+						ctx,
+						&checkpoint.actor_id,
+						checkpoint.generation,
+						Some("node is draining; actor start refused"),
+					)
+					.await;
+					continue;
+				}
 				let actor_name = val.config.name.clone();
 				let (handle, active_http_request_count) = create_actor(
 					ctx.shared.clone(),
@@ -216,6 +226,7 @@ pub async fn handle_commands(ctx: &mut EnvoyContext, commands: Vec<protocol::Com
 						ctx,
 						&checkpoint.actor_id,
 						checkpoint.generation,
+						None,
 					)
 					.await;
 				}
@@ -245,7 +256,8 @@ pub async fn handle_commands(ctx: &mut EnvoyContext, commands: Vec<protocol::Com
 
 /// Answers a stop for a generation this Envoy does not run with a stopped event, so the
 /// engine ends the epoch now; it would otherwise keep resending the stop. The generation either never
-/// started here or already stopped, and the engine sends a generation's commands only to the
+/// started here or already stopped. Generations still finishing locally wait for their own
+/// report even after routing retirement. The engine sends a generation's commands only to the
 /// Envoy it allocated, so no other Envoy runs it either.
 ///
 /// The stopped floor is recorded first: a start for this generation that the stop overtook
@@ -255,7 +267,18 @@ async fn report_unhosted_generation_stopped(
 	ctx: &mut EnvoyContext,
 	actor_id: &str,
 	generation: u32,
+	error: Option<&str>,
 ) {
+	if ctx
+		.unfinished_actors
+		.contains(&(actor_id.to_owned(), generation))
+	{
+		// Losing routing does not finish local teardown. The actor already received
+		// Lost and must report its own outcome; a synthetic success here could end
+		// its Engine epoch while cleanup or the final state save is still running.
+		tracing::debug!(%actor_id, generation, "waiting for retired actor's local teardown");
+		return;
+	}
 	ctx.stopped_generation_floors.record(
 		actor_id,
 		generation,
@@ -285,8 +308,12 @@ async fn report_unhosted_generation_stopped(
 		},
 		inner: protocol::Event::EventActorStateUpdate(protocol::EventActorStateUpdate {
 			state: protocol::ActorState::ActorStateStopped(protocol::ActorStateStopped {
-				code: protocol::StopCode::Ok,
-				message: None,
+				code: if error.is_some() {
+					protocol::StopCode::Error
+				} else {
+					protocol::StopCode::Ok
+				},
+				message: error.map(|message| message.to_owned().into()),
 			}),
 		}),
 	};

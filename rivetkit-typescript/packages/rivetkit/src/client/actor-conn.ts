@@ -50,9 +50,7 @@ import {
 import { ACTOR_CONNS_SYMBOL, type ClientRaw } from "./client";
 import * as errors from "./errors";
 import { isRetryableLifecycleReconnectSignal } from "./lifecycle-errors";
-import { retryAfterMs } from "./retry-budget";
 import { logger } from "./log";
-import { isInvalidToken } from "./token-provider";
 import { outboundTelemetryHeaders } from "./outbound-telemetry";
 import {
 	createQueueSender,
@@ -61,6 +59,8 @@ import {
 	type QueueSendResult,
 	type QueueSendWaitOptions,
 } from "./queue";
+import { retryAfterMs } from "./retry-budget";
+import { isInvalidToken } from "./token-provider";
 import {
 	type WebSocketMessage as ConnMessage,
 	messageLength,
@@ -160,6 +160,8 @@ export class ActorConnRaw {
 	#abortController = new AbortController();
 
 	#connStatus: ActorConnStatus = "idle";
+	/** The opening failure that stopped retries. Later actions must fail instead of queueing. */
+	#connectionOpenError?: errors.ActorError;
 
 	#actorId?: string;
 	#connId?: string;
@@ -356,6 +358,8 @@ export class ActorConnRaw {
 				`Invalid action call: expected an options object { name, args }, got ${typeof opts}. Use conn.actionName(...args) for the shorthand API.`,
 			);
 		}
+		if (this.#disposed) throw new errors.ActorConnDisposed();
+		if (this.#connectionOpenError) throw this.#connectionOpenError;
 		logger().debug({ msg: "action", name: opts.name, args: opts.args });
 
 		// If we have an active connection, use the websockactionId
@@ -466,6 +470,7 @@ export class ActorConnRaw {
 	}
 
 	#connectWithRetry() {
+		this.#connectionOpenError = undefined;
 		this.#setConnStatus("connecting");
 
 		// Attempt to reconnect indefinitely
@@ -523,6 +528,11 @@ export class ActorConnRaw {
 			// Wait for result
 			await this.#waitForOpen(this.#onOpenPromise.promise);
 		} catch (error) {
+			this.#abandonCurrentSocket(
+				isConnectionOpenTimeout(error)
+					? "Connect timeout"
+					: "Connection opening failed",
+			);
 			if (this.#shouldRetryConnectionOpenError(error)) {
 				throw error;
 			}
@@ -537,7 +547,7 @@ export class ActorConnRaw {
 							{ error: stringifyError(error) },
 						);
 
-			this.#clearQueuedMessages();
+			this.#connectionOpenError = actorError;
 			this.#rejectPendingPromises(actorError, false);
 			this.#dispatchActorError(actorError);
 			this.#setConnStatus("idle");
@@ -573,29 +583,24 @@ export class ActorConnRaw {
 		});
 		try {
 			await Promise.race([open, timedOut]);
-		} catch (error) {
-			if (isConnectionOpenTimeout(error)) {
-				this.#abandonCurrentSocket();
-			}
-			throw error;
 		} finally {
 			clearTimeout(timer);
 		}
 	}
 
-	#abandonCurrentSocket() {
+	#abandonCurrentSocket(reason: string) {
 		const ws = this.#websocket;
 		if (!ws) return;
 		this.#websocket = undefined;
 		this.#abandonedSockets.add(ws);
-		logger().warn({
-			msg: "connection did not open in time, retrying",
+		logger().debug({
+			msg: "closing failed connection attempt",
 			connId: this.#connId,
 			readyState: ws.readyState,
-			timeoutMs: CONNECT_TIMEOUT_MS,
+			reason,
 		});
 		try {
-			ws.close(1000, "Connect timeout");
+			ws.close(1000, reason);
 		} catch (err) {
 			logger().debug({
 				msg: "failed to close abandoned websocket",
@@ -923,18 +928,8 @@ export class ActorConnRaw {
 					}
 				}
 
-				// If we have an onOpenPromise, reject it with the error
-				if (this.#onOpenPromise) {
-					this.#onOpenPromise.reject(errorToThrow);
-				}
-
 				this.#invalidateActorIfStale(group, code);
-
-				// Reject any in-flight requests
-				for (const [id, inFlight] of this.#actionsInFlight.entries()) {
-					inFlight.reject(errorToThrow);
-					this.#actionsInFlight.delete(id);
-				}
+				this.#rejectPendingPromises(errorToThrow, false);
 
 				this.#dispatchActorError(errorToThrow);
 			}
@@ -1100,6 +1095,8 @@ export class ActorConnRaw {
 	}
 
 	#rejectPendingPromises(error: Error, suppressUnhandled: boolean) {
+		// Rejected actions must not survive in the queue and execute after a reconnect.
+		this.#clearQueuedMessages();
 		if (this.#onOpenPromise) {
 			if (suppressUnhandled) {
 				this.#onOpenPromise.promise.catch(() => {});

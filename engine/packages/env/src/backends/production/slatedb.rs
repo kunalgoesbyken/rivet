@@ -338,6 +338,7 @@ impl SlateDbFactory for ProductionSlateDbFactory {
 		manifest: u64,
 		range: (std::ops::Bound<bytes::Bytes>, std::ops::Bound<bytes::Bytes>),
 		limit: usize,
+		filters: Vec<Arc<dyn slatedb::FilterPolicy>>,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<(bytes::Bytes, bytes::Bytes)>>> + Send + '_>> {
 		Box::pin(async move {
 			ensure!(limit > 0 && limit <= 128, "invalid checkpoint page size");
@@ -356,6 +357,7 @@ impl SlateDbFactory for ProductionSlateDbFactory {
 			);
 			let reader = slatedb::DbReader::builder(path, self.db_store.clone())
 				.with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint))
+				.with_filter_policies(filters)
 				.with_db_cache_disabled()
 				.with_system_clock(Arc::new(SlateClock(self.env.clock())))
 				.with_seed(self.env.rng("slatedb.checkpoint_page").next_u64())

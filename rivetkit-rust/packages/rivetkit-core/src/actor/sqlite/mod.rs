@@ -1436,6 +1436,15 @@ impl SqliteDb {
 	}
 
 	fn remote_sqlite_error_response(&self, error: protocol::SqliteErrorResponse) -> anyhow::Error {
+		if let Some(retry_after_ms) =
+			sqlite_types::storage_overload_retry_after_ms(&error.group, &error.code, &error.message)
+		{
+			return SqliteRuntimeError::StorageOverloaded {
+				retry_after_ms,
+				message: error.message.to_string(),
+			}
+			.build();
+		}
 		if is_head_fence_mismatch_response(&error) {
 			if let Ok(config) = self.runtime_config() {
 				report_sqlite_worker_fatal(

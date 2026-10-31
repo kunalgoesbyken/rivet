@@ -10,7 +10,7 @@ use crate::fs::{
 	DirEntry, DirectoryHandle, DiskSpace, File, FileHandle, FileSystem, FsFuture, LockScope,
 	OpenOptions, ReadDir,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
 use std::path::Path;
 use tokio::fs;
@@ -129,9 +129,8 @@ const LOCAL_LOCK_FILESYSTEMS: [i64; 4] = [
 ];
 
 /// The running kernel's boot ID and the file's device and inode, for a file on a local
-/// filesystem whose locks are kernel state. Only Linux exposes a boot ID, so other platforms
-/// report no scope. A cloned VM snapshot shares its boot ID and disk with the original, so
-/// running both is unsupported.
+/// filesystem whose locks are kernel state. A cloned VM snapshot shares its boot ID and disk
+/// with the original, so running both is unsupported.
 #[cfg(target_os = "linux")]
 async fn lock_scope(file: &fs::File, metadata: &std::fs::Metadata) -> std::io::Result<LockScope> {
 	let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -160,7 +159,68 @@ async fn lock_scope(file: &fs::File, metadata: &std::fs::Metadata) -> std::io::R
 	})
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS exposes the running kernel's UUID through `kern.bootsessionuuid`. Only native local
+/// APFS and HFS filesystems qualify: network and userspace filesystem locks prove nothing
+/// about another process's death. Read both filesystem and inode identity from the held handle.
+#[cfg(target_os = "macos")]
+async fn lock_scope(file: &fs::File, metadata: &std::fs::Metadata) -> std::io::Result<LockScope> {
+	use std::io::{Error, ErrorKind};
+
+	let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+	// SAFETY: the descriptor stays open for the call and `stats` is a valid out pointer.
+	if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	// SAFETY: fstatfs returned success, so it initialized `stats`.
+	let stats = unsafe { stats.assume_init() };
+	let filesystem = stats.f_fstypename.map(|byte| byte as u8);
+	let filesystem = std::ffi::CStr::from_bytes_until_nul(&filesystem)
+		.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+	if stats.f_flags & libc::MNT_LOCAL as u32 == 0
+		|| !matches!(filesystem.to_bytes(), b"apfs" | b"hfs")
+	{
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			format!("filesystem {filesystem:?} has no kernel-local lock scope"),
+		));
+	}
+
+	// One canonical UUID plus its NUL terminator. A denied or unexpected response leaves
+	// bootstrap on the existing lease-wait path; never substitute a machine or disk UUID.
+	let mut boot_id = [0u8; 37];
+	let mut length = boot_id.len();
+	// SAFETY: the name is NUL-terminated, the buffer and length pointer are valid, and the
+	// null new-value pointer with length zero requests a read without changing kernel state.
+	if unsafe {
+		libc::sysctlbyname(
+			c"kern.bootsessionuuid".as_ptr(),
+			boot_id.as_mut_ptr().cast(),
+			&mut length,
+			std::ptr::null_mut(),
+			0,
+		)
+	} != 0
+	{
+		return Err(std::io::Error::last_os_error());
+	}
+	let boot_id = boot_id.get(..length).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"kernel boot UUID exceeds its buffer",
+		)
+	})?;
+	let boot_id = std::ffi::CStr::from_bytes_with_nul(boot_id)
+		.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+	let boot_id = uuid::Uuid::try_parse_ascii(boot_id.to_bytes())
+		.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+	Ok(LockScope {
+		kernel_boot_id: boot_id.into_bytes(),
+		device: metadata.dev(),
+		inode: metadata.ino(),
+	})
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn lock_scope(_file: &fs::File, _metadata: &std::fs::Metadata) -> std::io::Result<LockScope> {
 	Err(std::io::Error::new(
 		std::io::ErrorKind::Unsupported,

@@ -30,12 +30,13 @@ pub enum Read {
 	Unknown,
 }
 
-/// Every outcome other than `Confirmed` is resolved by reading the heartbeat back.
+/// Conditional conflicts trigger readback; uncertain renewals retain their original send
+/// times until a later write or readback confirms them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Write {
 	/// Store-confirmed ETag used by the next CAS; the original send time still bounds the lease.
 	Confirmed(String),
-	/// The CAS precondition failed. The executor currently reports this as `Unknown`.
+	/// The conditional create or update failed; read back to identify the stored write.
 	Conflict,
 	/// The write may or may not have landed.
 	Unknown,

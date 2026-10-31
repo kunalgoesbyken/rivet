@@ -88,6 +88,8 @@ pub struct Command {
 pub enum Timer {
 	Operation(u64),
 	Retry,
+	/// Dispatch the retained, unsent CAS after the backend mutation interval.
+	WritePacing,
 	Balance,
 	/// The earliest deadline of a Learning phase in the confirmed manifest.
 	LearningDeadline,

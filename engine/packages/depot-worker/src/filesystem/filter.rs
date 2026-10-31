@@ -215,6 +215,14 @@ impl slatedb::PrefixExtractor for RowPrefixExtractor {
 		}
 	}
 }
+
+/// Policies shared by filesystem SST writers and retained-checkpoint readers.
+pub(crate) fn sst_filters() -> Vec<Arc<dyn slatedb::FilterPolicy>> {
+	vec![Arc::new(
+		slatedb::BloomFilterPolicy::new(10).with_prefix_extractor(Arc::new(RowPrefixExtractor)),
+	)]
+}
+
 /// The tablet database's storage policy: 4 KiB SST blocks, so each page keeps its own block
 /// and index entry, a bloom filter over row and scope prefixes, and a block cache that also
 /// takes each memtable flush's data blocks.
@@ -227,14 +235,10 @@ pub(crate) fn storage_policy_in_range(
 	clock: Arc<dyn Clock>,
 	hash_range: Option<depot_types::PartitionKeyHashRange>,
 ) -> StoragePolicy {
-	let filters: Vec<Arc<dyn slatedb::FilterPolicy>> = vec![Arc::new(
-		slatedb::BloomFilterPolicy::new(10).with_prefix_extractor(Arc::new(RowPrefixExtractor)),
-	)];
-
 	StoragePolicy {
 		sst_block_size: Some(slatedb::SstBlockSize::Block4Kib),
 		block_cache: slatedb::BlockCachePolicy::default(),
-		filters: Some(filters),
+		filters: Some(sst_filters()),
 		compaction_filter: Some(Arc::new(VersionFilterSupplier {
 			catalog,
 			clock,

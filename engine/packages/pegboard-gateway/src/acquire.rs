@@ -309,13 +309,20 @@ impl Acquire<'_> {
 
 					// The failed open is the liveness check: read the envoy's record once.
 					tracing::debug!(%error, "actor channel open failed; reading the envoy record");
-					match envoy_check(ctx, &actor, &allocation).await? {
+					match envoy_check(ctx, &actor, &allocation, Some(&error)).await? {
 						EnvoyCheck::Newer(newer) => match self.open(&newer).await {
 							Ok(stream) => {
 								// The allocation's route is stale for the rest of the epoch
 								// unless someone records what this request learned.
 								repair_route(ctx, self.actor_id, epoch, &allocation, newer);
 								return Ok((epoch, stream));
+							}
+							Err(error)
+								if pegboard::actor_machine::executor::no_responders(&error) =>
+							{
+								// This newer route ended too. The stop executor reads the record
+								// again and waits for the old epoch to stop before replacing it.
+								next = self.reallocate(epoch, true).await?;
 							}
 							Err(error) if retryable_open_error(&error) => {
 								tracing::debug!(%error, "actor channel open failed on the envoy's newer connection");
@@ -494,7 +501,7 @@ impl Acquire<'_> {
 		if self.wait.last_wake() != Some(Wake::Poll) {
 			return Ok(None);
 		}
-		match envoy_check(self.ctx, actor, allocation).await? {
+		match envoy_check(self.ctx, actor, allocation, None).await? {
 			EnvoyCheck::Serving | EnvoyCheck::Newer(_) => Ok(None),
 			EnvoyCheck::Lost => Ok(Some(self.reallocate(epoch, true).await?)),
 			EnvoyCheck::Draining => Ok(Some(self.reallocate(epoch, false).await?)),
@@ -546,7 +553,7 @@ enum EnvoyCheck {
 	Serving,
 	/// The same envoy process reconnected and kept its actors; open its newer connection.
 	Newer(Route),
-	/// The envoy is gone, so no execution there survives.
+	/// The envoy or its connection is gone. Reallocation stops the old epoch before replacing it.
 	Lost,
 	/// The envoy is draining.
 	Draining,
@@ -558,6 +565,7 @@ async fn envoy_check(
 	ctx: &EngineContext,
 	actor: &wire::ActorData,
 	allocation: &wire::ActorAllocation,
+	failed_open: Option<&anyhow::Error>,
 ) -> Result<EnvoyCheck> {
 	let route = Route::of_allocation(allocation)?;
 	let volume = EnvoyVolume::new(
@@ -586,6 +594,16 @@ async fn envoy_check(
 	}
 
 	let current = Route::of_envoy(&envoy)?;
+	// A restarted engine keeps its worker ID, so its live lease cannot prove that an
+	// old connection ended. A no-responders reply can. Prefer a newer connection
+	// when the record has one; otherwise enter the existing stop protocol, which records
+	// the disconnect and waits out the node's lost threshold before ending the epoch.
+	if envoy.connected
+		&& current == route
+		&& failed_open.is_some_and(pegboard::actor_machine::executor::no_responders)
+	{
+		return Ok(EnvoyCheck::Lost);
+	}
 	let lease_ended = match ctx.topology().worker_lease(&route.worker).await {
 		rivet_topology::WorkerLease::Expired | rivet_topology::WorkerLease::Released => true,
 		rivet_topology::WorkerLease::Live | rivet_topology::WorkerLease::Unknown => false,

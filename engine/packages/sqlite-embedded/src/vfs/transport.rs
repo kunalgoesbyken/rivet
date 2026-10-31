@@ -322,32 +322,14 @@ impl std::fmt::Display for SqliteStorageTimeoutError {
 
 impl std::error::Error for SqliteStorageTimeoutError {}
 
-/// The group and code of a storage refusal that ran nothing and carries a retry hint.
-const DEPOT_OVERLOADED_GROUP: &str = "depot";
-const DEPOT_OVERLOADED_CODE: &str = "overloaded";
-
-/// The hint a `depot.overloaded` response carries in its message, or this when it names none.
-const DEFAULT_OVERLOADED_RETRY_AFTER_MS: u64 = 100;
-
 /// The typed failure a storage error response stands for, if it is a refusal with a hint.
 fn storage_refusal(error: &protocol::SqliteErrorResponse) -> Option<SqliteStorageError> {
-	if error.group.as_str() != DEPOT_OVERLOADED_GROUP
-		|| error.code.as_str() != DEPOT_OVERLOADED_CODE
-	{
-		return None;
-	}
-	let message = error.message.to_string();
+	let retry_after_ms =
+		sqlite_types::storage_overload_retry_after_ms(&error.group, &error.code, &error.message)?;
 	Some(SqliteStorageError::Overloaded {
-		retry_after_ms: retry_after_hint(&message).unwrap_or(DEFAULT_OVERLOADED_RETRY_AFTER_MS),
-		message,
+		retry_after_ms,
+		message: error.message.to_string(),
 	})
-}
-
-/// Reads the `retry_after_ms=<ms>` parameter Engine writes into a refusal's message.
-fn retry_after_hint(message: &str) -> Option<u64> {
-	let (_, rest) = message.split_once("retry_after_ms=")?;
-	let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-	digits.parse().ok()
 }
 
 /// The typed failure a transport error stands for, if it is a timeout that changed nothing.

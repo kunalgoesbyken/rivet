@@ -1,0 +1,20 @@
+{
+	"name": "@rivetkit/cli",
+	"version": "3.0.0-preview.3",
+	"description": "Rivet Cloud CLI",
+	"license": "Apache-2.0",
+	"main": "index.js",
+	"types": "index.d.ts",
+	"bin": {
+		"rivet": "index.js"
+	},
+	"engines": {
+		"node": ">= 20.0.0"
+	},
+	"files": [
+		"index.js",
+		"index.d.ts",
+		"package.json",
+		"README.md"
+	]
+}

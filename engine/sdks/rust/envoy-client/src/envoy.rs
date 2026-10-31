@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
@@ -38,7 +38,7 @@ use crate::sqlite::{
 	process_unsent_sqlite_requests,
 };
 use crate::tunnel::{
-	HttpRequestCancellationKey, handle_tunnel_message, make_ws_key,
+	CompletedHttpRequests, HttpRequestCancellationKey, handle_tunnel_message, make_ws_key,
 	resend_buffered_tunnel_messages, send_hibernatable_ws_message_ack,
 };
 use crate::utils::{BufferMap, EnvoyShutdownError, SleepFuture, boxed_sleep, spawn_detached};
@@ -52,8 +52,11 @@ static GLOBAL_ENVOY: OnceLock<Mutex<Option<EnvoyHandle>>> = OnceLock::new();
 
 pub struct EnvoyContext {
 	pub shared: Arc<SharedContext>,
-	pub shutting_down: bool,
+	pub shutdown: crate::shutdown_machine::State,
 	pub actors: HashMap<String, HashMap<u32, ActorEntry>>,
+	/// Accepted generations whose local task completion has not reached this loop,
+	/// including generations retired from routing after connection loss.
+	pub unfinished_actors: BTreeSet<(String, u32)>,
 	pub pending_events: HashMap<(String, u32), PendingActorEvents>,
 	pub pending_events_ack_waiters: Vec<oneshot::Sender<()>>,
 	pub buffered_actor_messages: HashMap<String, Vec<BufferedActorMessage>>,
@@ -69,6 +72,9 @@ pub struct EnvoyContext {
 	/// Recently cancelled exact-generation requests. This prevents a delayed
 	/// `RequestStart` from reaching the actor after its cancellation arrived.
 	pub http_request_cancellations: HashMap<HttpRequestCancellationKey, crate::time::Instant>,
+	/// Recently finished requests. Gateway can still send body frames, its own body cancel,
+	/// or response credit for them, and those frames must not abort the finished response.
+	pub completed_http_requests: CompletedHttpRequests,
 	pub buffered_messages: Vec<protocol::ToRivetTunnelMessage>,
 	/// Highest stopped generation per actor, so a late duplicate start is dropped.
 	pub stopped_generation_floors: crate::commands::StoppedGenerationFloors,
@@ -152,6 +158,23 @@ pub enum ToEnvoyMessage {
 	SendEvents {
 		events: Vec<protocol::EventWrapper>,
 	},
+	/// **When**
+	///
+	/// The actor task wrapper observes local teardown complete, after the actor's
+	/// final report has been enqueued and its request tasks have been joined.
+	///
+	/// **State**
+	///
+	/// Removes only this generation's unfinished marker. Wire reports, synthetic
+	/// stopped reports, routing retirement, and inbox closure cannot remove it.
+	///
+	/// **Effects**
+	///
+	/// Shutdown reconciliation may advance to waiting for event acknowledgements.
+	ActorFinished {
+		actor_id: String,
+		generation: u32,
+	},
 	KvRequest {
 		actor_id: String,
 		data: protocol::KvRequestData,
@@ -205,6 +228,19 @@ pub enum ToEnvoyMessage {
 	},
 	WaitForEventsAcked(oneshot::Sender<()>),
 	MarkStopping(oneshot::Sender<bool>),
+	/// **When**
+	///
+	/// A host requests graceful shutdown.
+	///
+	/// **State**
+	///
+	/// Closes admission and latches the protocol stop deadline once. Callers observe the
+	/// shared termination outcome after transport cleanup.
+	///
+	/// **Effects**
+	///
+	/// Announces stopping and requests sleep for every accepted generation. The loop
+	/// keeps processing storage, stop reports and ACKs until completion or the deadline.
 	Shutdown,
 	Stop,
 }
@@ -262,6 +298,8 @@ impl EnvoyContext {
 		name: String,
 		last_command_idx: i64,
 	) {
+		self.unfinished_actors
+			.insert((actor_id.clone(), generation));
 		let buffered_actor_id = actor_id.clone();
 		let buffered_handle = handle.clone();
 		self.actors
@@ -372,6 +410,9 @@ impl EnvoyContext {
 		actor_id: &str,
 		generation: Option<u32>,
 	) -> Option<&ActorEntry> {
+		if self.shutdown.is_draining() {
+			return None;
+		}
 		let actor = self.get_actor(actor_id, generation)?;
 		if generation.is_some() && actor.received_stop {
 			None
@@ -438,7 +479,8 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 		.set(config.max_queued_requests_per_actor as i64);
 	let (envoy_tx, envoy_rx) = mpsc::unbounded_channel::<ToEnvoyMessage>();
 	let (start_tx, start_rx) = tokio::sync::watch::channel(None);
-	let (stopped_tx, _stopped_rx) = tokio::sync::watch::channel(false);
+	let (stopped_tx, _stopped_rx) =
+		tokio::sync::watch::channel(crate::context::StopStatus::Running);
 	let (connection_session_tx, _connection_session_rx) = tokio::sync::watch::channel(0);
 
 	let envoy_key = uuid::Uuid::new_v4().to_string();
@@ -472,8 +514,9 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 
 	let ctx = EnvoyContext {
 		shared: shared.clone(),
-		shutting_down: false,
+		shutdown: Default::default(),
 		actors: HashMap::new(),
+		unfinished_actors: BTreeSet::new(),
 		pending_events: HashMap::new(),
 		pending_events_ack_waiters: Vec::new(),
 		buffered_actor_messages: HashMap::new(),
@@ -487,6 +530,7 @@ fn start_envoy_sync_inner(config: EnvoyConfig) -> EnvoyHandle {
 		http_request_routes: BufferMap::new(),
 		http_message_indices: BufferMap::new(),
 		http_request_cancellations: HashMap::new(),
+		completed_http_requests: CompletedHttpRequests::default(),
 		buffered_messages: Vec::new(),
 		stopped_generation_floors: Default::default(),
 		processed_command_idx: HashMap::new(),
@@ -507,12 +551,33 @@ async fn envoy_loop(
 	connection_task: Option<tokio::task::JoinHandle<()>>,
 ) {
 	let mut lost_timeout: Option<SleepFuture> = None;
+	let mut acknowledged_shutdown = false;
 
 	loop {
-		let iter_start = crate::time::Instant::now();
+		let now = crate::time::Instant::now();
+		if let Some(completion) = ctx.shutdown.reconcile(
+			now,
+			!ctx.unfinished_actors.is_empty(),
+			!ctx.pending_events.is_empty(),
+		) {
+			acknowledged_shutdown = matches!(
+				completion,
+				crate::shutdown_machine::Completion::Acknowledged
+			);
+			if !acknowledged_shutdown {
+				tracing::warn!(
+					actors = ctx.unfinished_actors.len(),
+					pending_event_sets = ctx.pending_events.len(),
+					"node shutdown deadline reached before actor stops were acknowledged"
+				);
+			}
+			break;
+		}
+		let iter_start = now;
 		#[allow(unused_assignments)]
 		let mut branch: &'static str = "unknown";
 		tokio::select! {
+			_ = sleep_until_deadline(ctx.shutdown.deadline()) => { continue; }
 			msg = rx.recv() => {
 				branch = "envoy_msg";
 				let Some(msg) = msg else {
@@ -555,6 +620,9 @@ async fn envoy_loop(
 					ToEnvoyMessage::SendEvents { events } => {
 						handle_send_events(&mut ctx, events).await;
 					}
+					ToEnvoyMessage::ActorFinished { actor_id, generation } => {
+						ctx.unfinished_actors.remove(&(actor_id, generation));
+					}
 					ToEnvoyMessage::KvRequest { actor_id, data, response_tx } => {
 						handle_kv_request(&mut ctx, actor_id, data, response_tx).await;
 					}
@@ -596,8 +664,7 @@ async fn envoy_loop(
 						let _ = response_tx.send(rebound);
 					}
 					ToEnvoyMessage::HttpRequestComplete { gateway_id, request_id } => {
-						ctx.http_request_routes.remove(&[&gateway_id, &request_id]);
-						ctx.http_message_indices.remove(&[&gateway_id, &request_id]);
+						crate::tunnel::complete_http_request(&mut ctx, gateway_id, request_id);
 					}
 					ToEnvoyMessage::GetActor { actor_id, generation, response_tx } => {
 						let info = ctx.get_actor(&actor_id, generation).map(|entry| {
@@ -660,6 +727,15 @@ async fn envoy_loop(
 		observe_envoy_loop_iteration(branch, iter_start);
 	}
 
+	// Only final closure disables reconnects. Draining may need a new connection
+	// to flush storage requests and replay stopped reports before its deadline.
+	ctx.shared.shutting_down.store(true, Ordering::Release);
+	if !acknowledged_shutdown {
+		// Revoke local execution as well as the connection. An interrupted drain
+		// cannot promise persistence; actors still need the existing lost cleanup
+		// path when the Engine never answered their sleep intents.
+		stop_all_actors_lost(&mut ctx);
+	}
 	// Cleanup
 	{
 		let guard = ctx.shared.ws_tx.lock().await;
@@ -700,7 +776,13 @@ async fn envoy_loop(
 	// retains the last value.
 	// A local development shutdown may finish before its caller starts waiting.
 	// Keep the stopped state even when no receiver is subscribed yet.
-	ctx.shared.stopped_tx.send_replace(true);
+	ctx.shared
+		.stopped_tx
+		.send_replace(if acknowledged_shutdown {
+			crate::context::StopStatus::Acknowledged
+		} else {
+			crate::context::StopStatus::Interrupted
+		});
 }
 
 pub(crate) fn remove_http_routes_for_session(ctx: &mut EnvoyContext, session: u64) {
@@ -777,6 +859,9 @@ async fn handle_conn_message(
 			}
 
 			lost_timeout = None;
+			if ctx.shutdown.is_draining() {
+				ws_send(&ctx.shared, protocol::ToRivet::ToRivetStopping).await;
+			}
 			resend_unacknowledged_events(ctx).await;
 			process_unsent_kv_requests(ctx).await;
 			process_unsent_sqlite_requests(ctx).await;
@@ -881,38 +966,32 @@ fn handle_conn_close(ctx: &EnvoyContext, lost_timeout: Option<SleepFuture>) -> O
 }
 
 async fn handle_shutdown(ctx: &mut EnvoyContext) {
-	if ctx.shutting_down {
+	let budget_ms = ctx
+		.shared
+		.protocol_metadata
+		.lock()
+		.await
+		.as_ref()
+		.map(|metadata| metadata.actor_stop_threshold)
+		.unwrap_or(30_000)
+		.max(1) as u64;
+	if !ctx.shutdown.begin(
+		crate::time::Instant::now(),
+		std::time::Duration::from_millis(budget_ms),
+	) {
 		return;
 	}
-	ctx.shutting_down = true;
-	ctx.shared.shutting_down.store(true, Ordering::Release);
-
-	tracing::debug!("envoy received shutdown");
-
 	ws_send(&ctx.shared, protocol::ToRivet::ToRivetStopping).await;
-
-	// Wait for all actors to finish. The process manager (Docker,
-	// k8s, etc.) provides the ultimate shutdown deadline.
-	let actor_handles: Vec<mpsc::UnboundedSender<ToActor>> = ctx
-		.actors
-		.values()
-		.flat_map(|gens| gens.values())
-		.filter(|entry| !entry.handle.is_closed())
-		.map(|entry| entry.handle.clone())
-		.collect();
-
-	let shared = ctx.shared.clone();
-	let shutdown_span = tracing::debug_span!(
-		parent: tracing::Span::current(),
-		"envoy_graceful_shutdown",
-		envoy_key = %ctx.shared.envoy_key,
-	);
-	spawn_detached(
-		async move {
-			futures_util::future::join_all(actor_handles.iter().map(|h| h.closed())).await;
-			tracing::debug!("all actors stopped during graceful shutdown");
-			let _ = send_to_envoy_tx(&shared, ToEnvoyMessage::Stop);
+	// Actor inboxes exist before asynchronous startup begins. Sleep intents queue
+	// behind startup; generations already processing an Engine stop retain its reason.
+	for generations in ctx.actors.values() {
+		for actor in generations.values() {
+			if !actor.received_stop {
+				let _ = actor.handle.send(ToActor::Intent {
+					intent: protocol::ActorIntent::ActorIntentSleep,
+					error: None,
+				});
+			}
 		}
-		.instrument(shutdown_span),
-	);
+	}
 }

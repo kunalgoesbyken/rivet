@@ -272,6 +272,18 @@ async fn run(
 		watch::channel(config.dynamic().depot().balancing.enabled);
 	let coordinator_service = Arc::new(
 		TabletCoordinatorService::new(env.clone(), deps.object_store.clone())
+			// GCS limits repeated mutations of one object. Bootstrap and balancing can
+			// otherwise outpace that limit even while the application has no traffic.
+			.with_manifest_write_interval_ms(
+				if matches!(
+					config.object_storage().primary,
+					rivet_config::config::ObjectStoreBackend::Gcs(_)
+				) {
+					1_000
+				} else {
+					0
+				},
+			)
 			.with_balancing(Some(balancing_settings(
 				&settings.balancing,
 				&deps.topology.config().lease,

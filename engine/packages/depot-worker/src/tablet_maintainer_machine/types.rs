@@ -833,6 +833,18 @@ pub enum MaintainerTimer {
 	/// **State** Releases the scheduled batch and queues one store pass.
 	/// **Effects** Writes ready rows and cuts subject to the existing byte and volume caps.
 	ColdBatch,
+	/// **When**
+	///
+	/// A retained creation reaches its retry deadline, including after its caller expires.
+	///
+	/// **State**
+	///
+	/// Releases initial entry buffers and reconciles quorum-held creation metadata. A
+	/// minority remains retained until idle; its expiry is rearmed while it is active.
+	///
+	/// **Effects**
+	///
+	/// Queues ordinary cold work, schedules another expiry, or collects proven orphans.
 	CreationExpired(depot_types::VolumeLogKey),
 	/// **When**
 	///

@@ -38,6 +38,68 @@ pub(crate) fn reject(request_id: RequestId, reason: VolumeRejectResponse, effect
 	});
 }
 
+/// Reconciles a creating open after its caller may have stopped waiting. Replica creation
+/// evidence proves the incarnation exists; ordinary quorum-tail checks still prove its data.
+pub(crate) fn creation_expired(
+	state: &mut MaintainerState,
+	key: VolumeLogKey,
+	effects: &mut Effects,
+) {
+	// Expiry ends replay of the original initial entries, preserving their issued fence.
+	state.release_initial_entries(&key);
+	let quorum = state.loaded_volumes.get(&key).is_some_and(|volume| {
+		volume
+			.creation
+			.as_ref()
+			.is_some_and(|creation| !creation.acknowledged)
+			&& super::replica_creation::acknowledged(state, volume)
+	});
+	if quorum && !super::filesystem::is_record_missing(state, &key) {
+		let volume = state
+			.loaded_volumes
+			.get_mut(&key)
+			.expect("observed creation");
+		volume
+			.creation
+			.as_mut()
+			.expect("retained creation")
+			.acknowledged = true;
+		if volume.stored_row.is_none()
+			&& !state.deleting.contains_key(&key)
+			&& !volume.is_deleted()
+			&& !state.pending_rows.contains(&key)
+			&& !state.operations.index().pass_rows.contains_key(&key)
+		{
+			state.pending_rows.push_back(key.clone());
+			super::cold_pass::row_queued(state, effects);
+		}
+		super::filesystem::offer(state, &key);
+	} else if let Some(volume) = state.loaded_volumes.get_mut(&key)
+		&& volume
+			.creation
+			.as_ref()
+			.is_some_and(|creation| !creation.acknowledged)
+	{
+		if volume.idle(state.now_boot_ms, state.config.idle_unload_after_ms) {
+			volume.creation = None;
+			super::filesystem::offer(state, &key);
+		} else {
+			// The first expiry precedes the default idle deadline. Keep checking for a
+			// late quorum or idle cleanup instead of retaining the creation forever.
+			effects.arm_timer_after(
+				MaintainerTimer::CreationExpired(key.clone()),
+				CREATION_RETRY_MS,
+			);
+		}
+	}
+	super::opening::collect_orphans(
+		state,
+		"creation_expired",
+		super::opening::OrphanScan::Volumes(vec![key]),
+		effects,
+	);
+}
+
 /// Rejects an open as overloaded and counts why, so a load run shows which admission
 /// limit or key conflict turned callers away.
 fn reject_overloaded(request_id: RequestId, reason: &'static str, effects: &mut Effects) {

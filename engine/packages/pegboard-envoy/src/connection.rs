@@ -817,14 +817,20 @@ async fn handle_sub_stream(
 						} else if let Ok(id) = id {
 							// The database volume opens while the command reaches the Envoy and
 							// the runtime starts, instead of at the actor's first storage request.
-							let conn = conn.clone();
 							let generation = command.checkpoint.generation;
 							let create_unix_ms = start.config.create_ts;
-							tasks.spawn(async move {
-								conn.sqlite
-									.prefetch(conn.ctx.depot(), id, generation, create_unix_ms)
-									.await;
-							});
+							// Reserve before spawning and forwarding the start, so a stop can
+							// retire its lane even when the open has not been polled yet.
+							match conn
+								.sqlite
+								.prefetch(conn.ctx.depot(), id, generation, create_unix_ms)
+								.await
+							{
+								Ok(prefetch) => {
+									tasks.spawn(prefetch);
+								}
+								Err(error) => tracing::debug!(%id, ?error, "actor database could not be prefetched; its first request opens it"),
+							}
 						}
 					}
 

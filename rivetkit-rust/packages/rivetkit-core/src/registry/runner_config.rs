@@ -40,7 +40,7 @@ async fn ensure_local_normal_runner_config_with_retry(
 		match ensure_local_normal_runner_config_once(client, config).await {
 			Ok(()) => return Ok(()),
 			Err(AttemptError::Fatal(error)) => return Err(error),
-			Err(AttemptError::Retryable(error)) if attempt == max_attempts => {
+			Err(AttemptError::Retryable { error, .. }) if attempt == max_attempts => {
 				return Err(error).with_context(|| {
 					format!(
 						"local node pool configuration `{}` did not become ready after {max_attempts} attempts",
@@ -48,7 +48,7 @@ async fn ensure_local_normal_runner_config_with_retry(
 					)
 				});
 			}
-			Err(AttemptError::Retryable(error)) => {
+			Err(AttemptError::Retryable { error, retry_after }) => {
 				tracing::debug!(
 					?error,
 					attempt,
@@ -57,7 +57,7 @@ async fn ensure_local_normal_runner_config_with_retry(
 					pool_name = %config.pool_name,
 					"local Engine namespace or node pool configuration is not ready; retrying"
 				);
-				sleep(retry_delay).await;
+				sleep(retry_delay.max(retry_after)).await;
 			}
 		}
 	}
@@ -80,19 +80,20 @@ async fn ensure_local_normal_runner_config_once(
 		.json(&body)
 		.send()
 		.await
-		.map_err(|error| {
-			AttemptError::Retryable(
-				anyhow::Error::new(error).context("upsert local node pool configuration"),
-			)
+		.map_err(|error| AttemptError::Retryable {
+			error: anyhow::Error::new(error).context("upsert local node pool configuration"),
+			retry_after: Duration::ZERO,
 		})?;
 	let status = response.status();
 	if !status.is_success() {
-		let response_body = response.text().await.map_err(|error| {
-			AttemptError::Retryable(
-				anyhow::Error::new(error)
+		let response_body = response
+			.text()
+			.await
+			.map_err(|error| AttemptError::Retryable {
+				error: anyhow::Error::new(error)
 					.context("read failed node pool configuration response body"),
-			)
-		})?;
+				retry_after: Duration::ZERO,
+			})?;
 		return Err(response_error(
 			format!(
 				"failed to upsert local node pool configuration `{}`",
@@ -114,7 +115,10 @@ async fn ensure_local_normal_runner_config_once(
 
 #[derive(Debug)]
 enum AttemptError {
-	Retryable(anyhow::Error),
+	Retryable {
+		error: anyhow::Error,
+		retry_after: Duration,
+	},
 	Fatal(anyhow::Error),
 }
 
@@ -126,17 +130,35 @@ impl From<anyhow::Error> for AttemptError {
 
 fn response_error(action: String, status: StatusCode, body: String) -> AttemptError {
 	let error = anyhow::Error::msg(format!("{action}: {status} {body}"));
-	let not_found = serde_json::from_str::<serde_json::Value>(&body)
-		.ok()
-		.and_then(|value| value.get("code")?.as_str().map(str::to_owned))
-		.as_deref()
-		== Some("not_found");
+	let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+	let group = parsed
+		.as_ref()
+		.and_then(|value| value.get("group")?.as_str());
+	let code = parsed
+		.as_ref()
+		.and_then(|value| value.get("code")?.as_str());
+	// Engines can report structured storage overloads as 400. The refusal is
+	// retryable regardless of that status; other client errors remain fatal.
+	let overloaded = group == Some("depot") && code == Some("overloaded");
 	if status == StatusCode::NOT_FOUND
 		|| status == StatusCode::TOO_MANY_REQUESTS
 		|| status.is_server_error()
-		|| not_found
+		|| code == Some("not_found")
+		|| overloaded
 	{
-		AttemptError::Retryable(error)
+		let retry_after = if overloaded {
+			parsed
+				.as_ref()
+				.and_then(|value| value.pointer("/metadata/retry_after_ms")?.as_u64())
+				.map(Duration::from_millis)
+				.unwrap_or_default()
+				// A longer hint cannot lead to another attempt within the enclosing
+				// startup timeout. Bound it before doing timer arithmetic.
+				.min(super::ENVOY_START_TIMEOUT)
+		} else {
+			Duration::ZERO
+		};
+		AttemptError::Retryable { error, retry_after }
 	} else {
 		AttemptError::Fatal(error)
 	}

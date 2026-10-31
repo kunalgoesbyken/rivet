@@ -164,7 +164,7 @@ RivetKit is a library. Connect it to Rivet Cloud or self-host when you need scal
 Install a package and run locally. No servers, no infrastructure. Actors run in your process during development.
 
 ```bash
-npm install rivetkit
+npm install rivetkit@next
 ```
 
 [Get started →](https://www.rivet.dev/docs/actors/quickstart)

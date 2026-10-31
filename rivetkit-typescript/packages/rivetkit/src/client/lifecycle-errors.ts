@@ -78,6 +78,19 @@ function classifyActorError(
 	}
 
 	if (
+		(error.group === "ups" && error.code === "consumer_closed") ||
+		(error.group === "depot" && error.code === "request_deadline_exceeded")
+	) {
+		// The connection can recover, but an interrupted action may already have run.
+		return buildLifecycleBoundaryInfo(
+			"reconnect_only",
+			"actor_error",
+			error.message,
+			{ group: error.group, code: error.code },
+		);
+	}
+
+	if (
 		error.group === "guard" &&
 		isRetryableGuardGatewayHttpError(error.code)
 	) {

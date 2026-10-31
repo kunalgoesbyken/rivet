@@ -31,24 +31,18 @@ pub async fn handle_send_events(ctx: &mut EnvoyContext, events: Vec<protocol::Ev
 		) {
 			retire(ctx, &event.checkpoint.actor_id, event.checkpoint.generation);
 		}
-		let mut remove_after_stop = false;
-		let entry =
-			ctx.get_actor_entry_mut(&event.checkpoint.actor_id, event.checkpoint.generation);
-		if let Some(entry) = entry {
-			if let protocol::Event::EventActorStateUpdate(ref state_update) = event.inner {
-				if matches!(
-					state_update.state,
-					protocol::ActorState::ActorStateStopped(_)
-				) {
-					// If the actor is being stopped by rivet, we don't need the entry anymore
-					if entry.received_stop {
-						remove_after_stop = true;
-					}
-				}
+		if matches!(
+			&event.inner,
+			protocol::Event::EventActorStateUpdate(protocol::EventActorStateUpdate {
+				state: protocol::ActorState::ActorStateStopped(_),
+			})
+		) {
+			if ctx
+				.get_actor_entry_mut(&event.checkpoint.actor_id, event.checkpoint.generation)
+				.is_some_and(|entry| entry.received_stop)
+			{
+				ctx.remove_actor(&event.checkpoint.actor_id, event.checkpoint.generation);
 			}
-		}
-		if remove_after_stop {
-			ctx.remove_actor(&event.checkpoint.actor_id, event.checkpoint.generation);
 		}
 	}
 
@@ -101,6 +95,11 @@ pub(crate) fn expire_terminal_events(
 	generation: u32,
 	now: crate::time::Instant,
 ) {
+	// A drain must finish by acknowledgement or its own deadline, never by silently
+	// discarding a report whose normal replay retention happens to expire meanwhile.
+	if ctx.shutdown.is_draining() {
+		return;
+	}
 	let key = (actor_id, generation);
 	let Some(retired_at) = ctx
 		.pending_events

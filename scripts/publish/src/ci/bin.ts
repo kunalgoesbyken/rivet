@@ -483,7 +483,7 @@ program
 			"",
 			`All packages published as \`${version}\` with tag \`${tag}\`.`,
 			"",
-			"Engine binary is shipped via `@rivetkit/engine-cli` on linux-x64-musl, linux-arm64-musl, darwin-x64, and darwin-arm64. Windows users can set `RIVET_ENGINE_BINARY` to a local build.",
+			"Engine binary is shipped via `@rivetkit/engine-cli` on linux-x64-musl, linux-arm64-musl, darwin-x64, and darwin-arm64. `@rivetkit/cli` ships the `rivet` binary plus bundled engine on the same platforms. Windows users can set `RIVET_ENGINE_BINARY` / `RIVET_CLI_BINARY` to a local build.",
 			"",
 			"Docker images:",
 			"```sh",

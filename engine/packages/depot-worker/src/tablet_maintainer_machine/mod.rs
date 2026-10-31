@@ -554,7 +554,7 @@ impl EphemeralStateMachine for TabletMaintainerMachine {
 						| state::MaintainerPhase::Stopped
 						| state::MaintainerPhase::Draining
 				) {
-					state::fence(state, effects);
+					state::revoke_lifetime(state, effects);
 					state.phase = state::MaintainerPhase::Draining;
 				}
 			}
@@ -600,23 +600,7 @@ impl EphemeralStateMachine for TabletMaintainerMachine {
 				state::member_repair::retry(state, key, worker, effects)
 			}
 			RuntimeEvent::Timer(MaintainerTimer::CreationExpired(key)) => {
-				// An expired creation sends no initial entries again, whether or not it stays.
-				state.release_initial_entries(&key);
-				if let Some(volume) = state.loaded_volumes.get_mut(&key)
-					&& volume.idle(state.now_boot_ms, state.config.idle_unload_after_ms)
-					&& volume
-						.creation
-						.as_ref()
-						.is_some_and(|creation| !creation.acknowledged)
-				{
-					volume.creation = None;
-				}
-				state::opening::collect_orphans(
-					state,
-					"creation_expired",
-					state::opening::OrphanScan::Volumes(vec![key]),
-					effects,
-				);
+				state::lifecycle::creation_expired(state, key, effects);
 			}
 			RuntimeEvent::Input(MaintainerEvent::WriteToColdResponse { op_id, result }) => {
 				state::cold_pass::completed(state, op_id, result, effects)

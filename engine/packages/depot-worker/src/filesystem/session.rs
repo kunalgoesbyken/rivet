@@ -439,6 +439,30 @@ impl ReadSession {
 		after: Option<&RowKey>,
 		limit: usize,
 	) -> Result<Vec<(RowKey, Row)>> {
+		// Fork/export callers interpret a short page as exhaustion, so retain the
+		// strict byte-limit error rather than returning a byte-limited short page.
+		self.scan_inner(range, after, limit, false).await
+	}
+
+	/// Range-deletion replay continues until an empty page. It may receive a short
+	/// page at the byte bound and resumes after the last returned key; the row that
+	/// did not fit is read again on the next page. A single oversized row still fails.
+	pub(super) async fn scan_for_apply(
+		&self,
+		range: &RowRange,
+		after: Option<&RowKey>,
+		limit: usize,
+	) -> Result<Vec<(RowKey, Row)>> {
+		self.scan_inner(range, after, limit, true).await
+	}
+
+	async fn scan_inner(
+		&self,
+		range: &RowRange,
+		after: Option<&RowKey>,
+		limit: usize,
+		allow_partial_page: bool,
+	) -> Result<Vec<(RowKey, Row)>> {
 		let snapshot = self.snapshot()?;
 		if limit > self.config.max_rows {
 			return Err(Error::TooLarge);
@@ -511,11 +535,17 @@ impl ReadSession {
 			}
 			seen = Some(key.clone());
 			if let Some(value) = keys::decode_row(&key, found.value.clone())? {
-				bytes = bytes
+				let next_bytes = bytes
 					.checked_add(found.key.len())
 					.and_then(|n| n.checked_add(found.value.len()))
-					.filter(|n| *n <= self.config.max_read_bytes)
-					.ok_or(Error::TooLarge)?;
+					.filter(|n| *n <= self.config.max_read_bytes);
+				let Some(next_bytes) = next_bytes else {
+					if allow_partial_page && !rows.is_empty() {
+						break;
+					}
+					return Err(Error::TooLarge);
+				};
+				bytes = next_bytes;
 				rows.push((key, value));
 			}
 		}

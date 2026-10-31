@@ -202,6 +202,7 @@ impl ColdStoreConfig {
 /// A database opened at the tablet grant epoch. Closing it joins its flusher,
 /// compactor and garbage collector before the owner may release the grant.
 pub struct ColdStore {
+	tablet_id: Uuid,
 	pub(crate) filesystem: std::sync::Arc<crate::filesystem::store::FilesystemStore>,
 	db: Db,
 	compaction_stalls: std::sync::Arc<crate::metrics::CompactionStalls>,
@@ -275,6 +276,7 @@ impl ColdStore {
 		)?
 		.with_observer(observer);
 		Ok(Self {
+			tablet_id,
 			filesystem: std::sync::Arc::new(filesystem),
 			compaction_stalls,
 			unflushed_full,
@@ -333,20 +335,39 @@ impl ColdStore {
 				policy,
 			)
 			.await?;
-		let mut filesystem = crate::filesystem::store::FilesystemStore::new(
-			db.clone(),
-			env.clock(),
-			guard,
-			catalog,
-			session_config,
-			1024,
-			env.rng("depot.filesystem.sessions"),
-		)?
-		.with_tablet_range(tablet.hash_range.clone())?
-		.with_checkpoints(config.checkpoints.clone())?
-		.with_flush_stage_concurrency(config.flush_stage_concurrency)?
-		.with_volume_lock_stripes(config.volume_lock_stripes)?
-		.with_volume_locks(config.volume_locks);
+		let filesystem = (|| -> Result<_> {
+			Ok(crate::filesystem::store::FilesystemStore::new(
+				db.clone(),
+				env.clock(),
+				guard,
+				catalog,
+				session_config,
+				1024,
+				env.rng("depot.filesystem.sessions"),
+			)?
+			.with_tablet_range(tablet.hash_range.clone())?
+			.with_checkpoints(config.checkpoints.clone())?
+			.with_flush_stage_concurrency(config.flush_stage_concurrency)?
+			.with_volume_lock_stripes(config.volume_lock_stripes)?
+			.with_volume_locks(config.volume_locks))
+		})();
+		let mut filesystem = match filesystem {
+			Ok(filesystem) => filesystem,
+			Err(error) => {
+				// Opening SlateDB started its background tasks. A later constructor
+				// failure must join them before giving the writer's ownership back.
+				db.close_with_options(
+					slatedb::config::CloseOptions::default().with_flush_type(None),
+				)
+				.await
+				.with_context(|| {
+					format!(
+						"failed to close writer after filesystem initialization failed: {error}"
+					)
+				})?;
+				return Err(error);
+			}
+		};
 		if let Some(reader) = base_reader {
 			filesystem = filesystem.with_base_reader(reader);
 		}
@@ -359,6 +380,7 @@ impl ColdStore {
 		let observer = std::sync::Arc::new(parking_lot::Mutex::new(observer));
 		let filesystem = std::sync::Arc::new(filesystem.with_observer(observer));
 		Ok(Self {
+			tablet_id,
 			filesystem,
 			db,
 			compaction_stalls,
@@ -489,6 +511,15 @@ impl ColdStore {
 	/// the uploader finish; everything else is dropped.
 	#[tracing::instrument(skip_all)]
 	pub async fn close_without_upload(self) -> Result<()> {
+		let status = self.db.status();
+		tracing::debug!(
+			tablet_id = %self.tablet_id,
+			grant_epoch = self.tablet_grant_epoch,
+			writer_epoch = status.current_manifest.writer_epoch(),
+			manifest_id = status.current_manifest.id(),
+			close_reason = ?status.close_reason,
+			"closing grant-owned SlateDB writer"
+		);
 		let options = slatedb::config::CloseOptions::default().with_flush_type(None);
 		self.db.close_with_options(options).await?;
 		Ok(())

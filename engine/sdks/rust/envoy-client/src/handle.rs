@@ -36,18 +36,29 @@ impl EnvoyHandle {
 	}
 
 	pub fn shutdown(&self, immediate: bool) {
-		self.shared.shutting_down.store(true, Ordering::Release);
-
 		if immediate {
+			self.shared.shutting_down.store(true, Ordering::Release);
 			let _ = crate::envoy::send_to_envoy_tx(&self.shared, ToEnvoyMessage::Stop);
 		} else {
 			let _ = crate::envoy::send_to_envoy_tx(&self.shared, ToEnvoyMessage::Shutdown);
 		}
 	}
 
+	/// Sleep every accepted generation, including starts in flight, then await final
+	/// event acknowledgements and transport closure. Returns false if the original
+	/// protocol stop deadline expires or closure is forced. Repeated callers join
+	/// the same drain and cannot extend its deadline. Reconnects remain enabled.
+	/// A false outcome is best effort: local lost cleanup is signalled, storage
+	/// requests fail, and the host remains responsible for its hard process deadline.
+	pub async fn shutdown_gracefully(&self) -> bool {
+		self.shutdown(false);
+		self.wait_stopped().await;
+		*self.shared.stopped_tx.borrow() == crate::context::StopStatus::Acknowledged
+	}
+
 	/// Withdraw this envoy from new allocations while keeping its connection
-	/// open to finish and acknowledge actor stops. Used by local development
-	/// reloads before they request actor sleep.
+	/// open to finish and acknowledge actor stops. Hosts call this before
+	/// requesting actor sleep during shutdown or local development reloads.
 	pub async fn mark_stopping(&self) -> bool {
 		let (response_tx, response_rx) = oneshot::channel();
 		if crate::envoy::send_to_envoy_tx(&self.shared, ToEnvoyMessage::MarkStopping(response_tx))
@@ -61,7 +72,7 @@ impl EnvoyHandle {
 	/// True once the envoy loop has finished its cleanup block. Latched: stays
 	/// true forever after the loop exits.
 	pub fn is_stopped(&self) -> bool {
-		*self.shared.stopped_tx.borrow()
+		*self.shared.stopped_tx.borrow() != crate::context::StopStatus::Running
 	}
 
 	/// Resolves when the envoy loop has finished its cleanup block.
@@ -75,7 +86,7 @@ impl EnvoyHandle {
 	/// A waiter arriving after the loop already exited resolves immediately.
 	pub async fn wait_stopped(&self) {
 		let mut rx = self.shared.stopped_tx.subscribe();
-		if *rx.borrow_and_update() {
+		if *rx.borrow_and_update() != crate::context::StopStatus::Running {
 			return;
 		}
 		let _ = rx.changed().await;

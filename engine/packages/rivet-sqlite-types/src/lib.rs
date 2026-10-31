@@ -20,6 +20,22 @@ pub fn is_transaction_too_large(group: &str, code: &str) -> bool {
 	group == TRANSACTION_TOO_LARGE_GROUP && code == TRANSACTION_TOO_LARGE_CODE
 }
 
+/// Recognizes a storage refusal that ran nothing and returns its retry delay. The page
+/// protocol carries the hint as `retry_after_ms=<ms>` in its message; older or malformed
+/// overload replies use 100 ms. Both local VFS and remote SQL use this classification.
+pub fn storage_overload_retry_after_ms(group: &str, code: &str, message: &str) -> Option<u64> {
+	if group != "depot" || code != "overloaded" {
+		return None;
+	}
+	let hint = message.split_once("retry_after_ms=").and_then(|(_, rest)| {
+		let end = rest
+			.find(|c: char| !c.is_ascii_digit())
+			.unwrap_or(rest.len());
+		rest[..end].parse::<u64>().ok()
+	});
+	Some(hint.unwrap_or(100))
+}
+
 /// Pages per storage shard. Shared rather than each side keeping its own copy: the client cuts
 /// staged commit segments on these boundaries and the engine rejects segments that are not cut on
 /// them, so two definitions could disagree and make every large commit fail.

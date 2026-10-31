@@ -351,6 +351,17 @@ impl Executor<TopologyStateMachine> for TopologyExecutor {
 
 							let result = match result {
 								Ok(result) => result.e_tag.map_or(Write::Unknown, Write::Confirmed),
+								Err(error)
+									if matches!(
+										error.downcast_ref::<object_store::Error>(),
+										Some(
+											object_store::Error::Precondition { .. }
+												| object_store::Error::AlreadyExists { .. }
+										)
+									) =>
+								{
+									Write::Conflict
+								}
 								Err(error) => {
 									tracing::warn!(%error, "topology heartbeat write outcome unknown; it will be retried or read back");
 									Write::Unknown

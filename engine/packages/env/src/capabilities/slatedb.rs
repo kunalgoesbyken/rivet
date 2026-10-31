@@ -73,6 +73,7 @@ pub trait SlateDbFactory: Send + Sync {
 	/// A bounded page from an exact retained checkpoint, without acquiring a writer.
 	/// Returns at most `limit` rows and 256 KiB; a short page can be byte-limited.
 	/// Only an empty page proves exhaustion. A single oversized row returns an error.
+	/// `filters` must use the same policies as the database that wrote the checkpoint.
 	fn checkpoint_page(
 		&self,
 		_path: Path,
@@ -80,6 +81,7 @@ pub trait SlateDbFactory: Send + Sync {
 		_manifest: u64,
 		_range: (Bound<Bytes>, Bound<Bytes>),
 		_limit: usize,
+		_filters: Vec<Arc<dyn slatedb::FilterPolicy>>,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<(Bytes, Bytes)>>> + Send + '_>> {
 		Box::pin(async { anyhow::bail!("checkpoint reads unavailable") })
 	}

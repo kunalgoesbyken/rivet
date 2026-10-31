@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Pegboard {
-	/// Maximum SQLite actor sessions retained by one node connection (default 256).
+	/// Maximum actor storage lanes retained by one node connection (default 4000).
+	/// Explicit overrides must be positive; each lane retains its database volume until stop.
 	pub sqlite_sessions: Option<usize>,
 	/// Idle time after which a remote SQL session is closed and reopened on next use.
 	///
@@ -200,6 +201,9 @@ impl Pegboard {
 		if !(1..=256).contains(&self.sqlite_remote_worker_threads()) {
 			bail!("pegboard.sqlite_remote_worker_threads must be in 1..=256");
 		}
+		if self.sqlite_sessions == Some(0) {
+			bail!("pegboard.sqlite_sessions must be greater than 0");
+		}
 
 		for (key, capacity) in [
 			(
@@ -386,7 +390,7 @@ impl Pegboard {
 	}
 
 	pub fn sqlite_sessions(&self) -> usize {
-		self.sqlite_sessions.unwrap_or(256)
+		self.sqlite_sessions.unwrap_or(4_000)
 	}
 
 	pub fn sqlite_server_prefetch(&self) -> bool {

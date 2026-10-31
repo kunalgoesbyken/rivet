@@ -52,7 +52,8 @@ pub trait FileHandle: AsyncRead + AsyncWrite + AsyncSeek + Unpin + Send + Sync {
 /// as the same disk attached to another machine or after a reboot, proves nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LockScope {
-	/// Random per kernel boot, such as Linux's `/proc/sys/kernel/random/boot_id`.
+	/// Random per kernel boot: Linux's `/proc/sys/kernel/random/boot_id` or macOS's
+	/// `kern.bootsessionuuid`.
 	pub kernel_boot_id: [u8; 16],
 	/// The locked file's device and inode numbers under that kernel.
 	pub device: u64,

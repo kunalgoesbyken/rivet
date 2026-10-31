@@ -39,6 +39,9 @@ pub enum Phase {
 	},
 	/// A failed I/O attempt retains its read/readback purpose through bounded backoff.
 	Waiting { context: ReadContext },
+	/// A prepared, unsent CAS waits for the backend's mutation interval. Its body and
+	/// precondition remain fixed; queued callers cannot be acknowledged before publication.
+	WaitingToWrite { write: ManifestWrite },
 	/// A single immutable CAS is outstanding; no command is acknowledged yet.
 	Writing {
 		operation: u64,
@@ -67,6 +70,10 @@ pub struct State {
 	pub max_requests: usize,
 	pub operation_timeout_ms: u64,
 	pub retry_ms: u64,
+	/// Backend-specific minimum quiet interval after a confirmed manifest mutation.
+	pub manifest_write_interval_ms: u64,
+	/// Earliest next manifest attempt in this process's boot clock; never persisted.
+	next_write_boot_ms: u64,
 	/// How long a replica-set change may stay in Learning before it is aborted.
 	pub learning_deadline_ms: u64,
 	/// The manifest version whose Learning abort was last dropped, so it is reported once.
@@ -92,6 +99,8 @@ impl Default for State {
 			stop_rounds: Default::default(),
 			operation_timeout_ms: 5_000,
 			retry_ms: 100,
+			manifest_write_interval_ms: 0,
+			next_write_boot_ms: 0,
 			learning_deadline_ms: reconfiguration::DEFAULT_LEARNING_DEADLINE_MS,
 			dropped_learning_abort: None,
 			next_operation: 0,
@@ -108,7 +117,14 @@ impl State {
 		effects.execute(Effect::ReadManifestRequest { operation });
 	}
 
-	fn write(&mut self, write: ManifestWrite, effects: &mut Effects) {
+	pub(super) fn write(&mut self, write: ManifestWrite, effects: &mut Effects) {
+		let now = effects.clocks().boot_ms;
+		if self.manifest_write_interval_ms > 0 && now < self.next_write_boot_ms {
+			self.phase = Phase::WaitingToWrite { write };
+			effects.arm_timer_at(Timer::WritePacing, self.next_write_boot_ms);
+			return;
+		}
+		self.next_write_boot_ms = now.saturating_add(self.manifest_write_interval_ms);
 		let operation = self.operation(effects);
 		self.phase = Phase::Writing {
 			operation,
@@ -153,6 +169,10 @@ impl State {
 				if let ReadContext::Resolve(write) = context {
 					reject_write(write, effects);
 				}
+			}
+			Phase::WaitingToWrite { write } => {
+				effects.cancel_timer(Timer::WritePacing);
+				reject_write(write, effects);
 			}
 			Phase::Writing { operation, write } => {
 				effects.cancel_timer(Timer::Operation(operation));
@@ -336,6 +356,10 @@ impl State {
 	}
 
 	fn confirm(&mut self, write: ManifestWrite, etag: String, effects: &mut Effects) {
+		self.next_write_boot_ms = effects
+			.clocks()
+			.boot_ms
+			.saturating_add(self.manifest_write_interval_ms);
 		match write.origin {
 			WriteOrigin::Takeover => {}
 			WriteOrigin::HandoffAborted { request_ids } => {
@@ -393,6 +417,7 @@ impl State {
 			| Phase::WaitingHandoff { .. }
 			| Phase::Writing { .. }
 			| Phase::Waiting { .. }
+			| Phase::WaitingToWrite { .. }
 			| Phase::Ready(_)
 			| Phase::Stopped => {}
 		}
@@ -439,18 +464,12 @@ impl State {
 		let mut changed = self.cleanup_stops(&mut manifest, effects);
 		while let Some(front) = self.queued.front() {
 			if matches!(front.request, Request::RequestStop(_))
-				|| (matches!(
-					front.request,
-					Request::GrantTablet(_) | Request::MoveTablet(_)
-				) && changed)
+				|| (has_previous_owner(&front.request, &manifest) && changed)
 			{
 				break;
 			}
 			let command = self.queued.pop_front().expect("front command");
-			let grant_command = matches!(
-				command.request,
-				Request::GrantTablet(_) | Request::MoveTablet(_)
-			);
+			let grant_command = has_previous_owner(&command.request, &manifest);
 			if let Request::SplitTablet(request) = &command.request
 				&& manifest.tablets.iter().any(|t| t.split.is_some())
 				&& !manifest
@@ -675,6 +694,21 @@ impl State {
 		*manifest = candidate;
 		(regrants.granted, missing_owner_grants)
 	}
+}
+
+/// Only an existing owner needs an isolated handoff barrier. First grants on distinct
+/// unowned tablets can share a CAS, so fresh-cluster provisioning fits its request budget
+/// even on a backend that permits one manifest mutation per second.
+fn has_previous_owner(request: &Request, manifest: &TabletManifest) -> bool {
+	let id = match request {
+		Request::GrantTablet(request) => request.tablet_id,
+		Request::MoveTablet(request) => request.tablet_id,
+		_ => return false,
+	};
+	manifest
+		.tablets
+		.iter()
+		.any(|tablet| tablet.id == id && tablet.maintainer.is_some())
 }
 
 fn reject_write(write: ManifestWrite, effects: &mut Effects) {

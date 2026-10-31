@@ -50,6 +50,7 @@ impl EphemeralStateMachine for TabletCoordinatorMachine {
 		match timer {
 			Timer::Operation(..) => "operation",
 			Timer::Retry => "retry",
+			Timer::WritePacing => "write_pacing",
 			Timer::Balance => "balance",
 			Timer::LearningDeadline => "learning_deadline",
 			Timer::DiskProbe(..) => "disk_probe",
@@ -218,6 +219,11 @@ impl EphemeralStateMachine for TabletCoordinatorMachine {
 					state.read(context.clone(), effects);
 				}
 			}
+			RuntimeEvent::Timer(Timer::WritePacing) => {
+				if let Phase::WaitingToWrite { write } = &state.phase {
+					state.write(write.clone(), effects);
+				}
+			}
 			RuntimeEvent::Timer(Timer::HandoffRetry(generation)) => {
 				if let Phase::WaitingHandoff { pending } = &state.phase {
 					if pending.generation == generation {
@@ -273,6 +279,7 @@ impl EphemeralStateMachine for TabletCoordinatorMachine {
 				Phase::Ready(stored) => Some(stored.manifest.clone()),
 				Phase::Reading { .. }
 				| Phase::Waiting { .. }
+				| Phase::WaitingToWrite { .. }
 				| Phase::CheckingHandoff { .. }
 				| Phase::WaitingHandoff { .. }
 				| Phase::Writing { .. }

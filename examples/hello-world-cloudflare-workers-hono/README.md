@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-`wrangler dev` runs the worker locally. Set `RIVET_ENDPOINT` to the Rivet endpoint for the namespace you want to use.
+`rivet dev` runs a local Rivet engine and spawns `wrangler dev` for you.
 
 ## Implementation
 

@@ -117,6 +117,7 @@ pub(crate) async fn initialize(
 				source.manifest_id,
 				(lower, Bound::Excluded(bytes::Bytes::copy_from_slice(&end))),
 				128,
+				crate::filesystem::filter::sst_filters(),
 			),
 		)
 		.await??;
@@ -215,6 +216,7 @@ async fn import_pending_work(
 				source.manifest_id,
 				(lower, end.clone()),
 				128,
+				crate::filesystem::filter::sst_filters(),
 			),
 		)
 		.await??;

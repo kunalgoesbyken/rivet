@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -32,10 +32,9 @@ const DEFAULT_BASE_PATH: &str = "/api/rivet";
 const SSE_PING_INTERVAL: Duration = Duration::from_secs(1);
 const SSE_PING_FRAME: &[u8] = b"event: ping\ndata:\n\n";
 const SSE_STOPPING_FRAME: &[u8] = b"event: stopping\ndata:\n\n";
-/// Bound on `handle.shutdown_and_wait` inside teardown paths. If envoy cannot
-/// reach the engine (reconnect loop stuck), we fall back to immediate `Stop`
-/// rather than hanging indefinitely. Must stay below the outer TS grace ceiling.
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Backstop for joining a transport already forced closed after failed startup.
+/// Normal actor shutdown uses the transport's single protocol stop deadline.
+const FAILED_START_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound on waiting for a new envoy to receive the engine's init message. A
 /// start that misses it is torn down so the next `/start` retries from scratch.
 const ENVOY_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +44,9 @@ pub struct CoreServerlessRuntime {
 	settings: Arc<ServerlessSettings>,
 	dispatcher: Arc<RegistryDispatcher>,
 	envoy: Arc<TokioMutex<Option<CachedEnvoy>>>,
+	/// Request-scoped transports remain owned until their shutdown completes.
+	uncached_envoys: Arc<TokioMutex<BTreeMap<String, EnvoyHandle>>>,
+	shutdown_lock: Arc<TokioMutex<()>>,
 	#[cfg(feature = "native-runtime")]
 	development_processes: Arc<TokioMutex<Option<DevelopmentProcessManager>>>,
 	shutting_down: Arc<AtomicBool>,
@@ -226,47 +228,50 @@ impl CoreServerlessRuntime {
 			}),
 			dispatcher,
 			envoy: Arc::new(TokioMutex::new(None)),
+			uncached_envoys: Arc::new(TokioMutex::new(BTreeMap::new())),
+			shutdown_lock: Arc::new(TokioMutex::new(())),
 			#[cfg(feature = "native-runtime")]
 			development_processes: Arc::new(TokioMutex::new(development_processes)),
 			shutting_down: Arc::new(AtomicBool::new(false)),
 		})
 	}
 
-	/// Tear down the cached envoy handle. Idempotent.
-	///
-	/// Sets `shutting_down` so concurrent `ensure_envoy` callers short-circuit
-	/// instead of starting a fresh envoy after teardown, and waits (with a
-	/// bounded timeout) for `envoy_loop` to exit. If the drain exceeds the
-	/// timeout (e.g. engine unreachable), falls back to an immediate `Stop`.
+	/// Close admission and join every owned transport's bounded shutdown. Concurrent
+	/// callers wait for the same teardown; managed processes remain alive until it ends.
 	pub async fn shutdown(&self) {
 		self.shutting_down.store(true, Ordering::Release);
-		let handle = { self.envoy.lock().await.take() }.map(|cached| cached.handle);
+		let _owner = self.shutdown_lock.lock().await;
+		let mut handles: Vec<_> = self
+			.uncached_envoys
+			.lock()
+			.await
+			.values()
+			.cloned()
+			.collect();
+		if let Some(cached) = self.envoy.lock().await.as_ref() {
+			handles.push(cached.handle.clone());
+		}
+		// Retain ownership until completion, and request every drain before awaiting
+		// any of them. Cancelling this caller cannot lose a transport or leave one
+		// accepting new starts; a later caller joins the same latched drains.
+		for handle in &handles {
+			handle.shutdown(false);
+		}
+		futures::future::join_all(handles.iter().map(|handle| handle.shutdown_gracefully())).await;
+		self.uncached_envoys.lock().await.clear();
+		self.envoy.lock().await.take();
 		#[cfg(feature = "native-runtime")]
-		let development_processes = { self.development_processes.lock().await.take() };
-		let shutdown_envoy = async move {
-			if let Some(handle) = handle {
-				match timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.shutdown_and_wait(false)).await {
-					Ok(()) => {}
-					Err(_) => {
-						tracing::warn!(
-							"serverless runtime envoy drain exceeded timeout; forcing immediate stop"
-						);
-						handle.shutdown(true);
-						handle.wait_stopped().await;
-					}
-				}
-			}
-		};
-		#[cfg(feature = "native-runtime")]
-		let shutdown_development_processes = async move {
-			if let Some(development_processes) = development_processes {
-				development_processes.shutdown().await;
-			}
-		};
-		#[cfg(feature = "native-runtime")]
-		tokio::join!(shutdown_envoy, shutdown_development_processes);
-		#[cfg(not(feature = "native-runtime"))]
-		shutdown_envoy.await;
+		if let Some(processes) = self.development_processes.lock().await.take() {
+			processes.shutdown().await;
+		}
+	}
+
+	async fn release_uncached_envoy(&self, handle: &EnvoyHandle) {
+		handle.shutdown_gracefully().await;
+		self.uncached_envoys
+			.lock()
+			.await
+			.remove(handle.get_envoy_key());
 	}
 
 	/// Wait (bounded) for active actors to reach zero, so an in-flight actor's `Stopped`
@@ -431,18 +436,27 @@ impl CoreServerlessRuntime {
 
 		let handle = self.ensure_envoy(&headers).await?;
 		let payload = req.body;
-		let actor_start = handle.decode_serverless_actor_start(&payload)?;
+		let actor_start = match handle.decode_serverless_actor_start(&payload) {
+			Ok(start) => start,
+			Err(error) => {
+				if !self.settings.cache_envoy {
+					self.release_uncached_envoy(&handle).await;
+				}
+				return Err(error);
+			}
+		};
 		let cancel_token = req.cancel_token;
 		let cache_envoy = self.settings.cache_envoy;
 		let (tx, rx) = mpsc::unbounded_channel();
 		let _ = tx.send(Ok(SSE_PING_FRAME.to_vec()));
 
+		let runtime = self.clone();
 		RuntimeSpawner::spawn(async move {
 			let shutdown_handle = handle.clone();
 			let result = tokio::select! {
 				_ = cancel_token.cancelled() => {
 					if !cache_envoy {
-						shutdown_handle.shutdown_and_wait(false).await;
+						runtime.release_uncached_envoy(&shutdown_handle).await;
 					}
 					return;
 				}
@@ -452,7 +466,7 @@ impl CoreServerlessRuntime {
 				let error = stream_error(error);
 				let _ = tx.send(Err(error));
 				if !cache_envoy {
-					handle.shutdown_and_wait(false).await;
+					runtime.release_uncached_envoy(&handle).await;
 				}
 				return;
 			}
@@ -475,7 +489,7 @@ impl CoreServerlessRuntime {
 			}
 
 			if !cache_envoy {
-				handle.shutdown_and_wait(false).await;
+				runtime.release_uncached_envoy(&handle).await;
 			}
 		});
 
@@ -567,10 +581,23 @@ impl CoreServerlessRuntime {
 			return Err(RuntimeShutDown.build());
 		}
 		if !self.settings.cache_envoy {
-			let handle = start_envoy_sync(self.envoy_config(headers));
+			let handle = {
+				let mut owners = self.uncached_envoys.lock().await;
+				if self.shutting_down.load(Ordering::Acquire) {
+					return Err(RuntimeShutDown.build());
+				}
+				let handle = start_envoy_sync(self.envoy_config(headers));
+				owners.insert(handle.get_envoy_key().to_owned(), handle.clone());
+				handle
+			};
 			let start_deadline = Instant::now() + ENVOY_START_TIMEOUT;
 			if let Err(reason) = wait_for_envoy_start(&handle, start_deadline).await {
-				return Err(self.stop_failed_envoy(&handle, reason).await);
+				let error = self.stop_failed_envoy(&handle, reason).await;
+				self.uncached_envoys
+					.lock()
+					.await
+					.remove(handle.get_envoy_key());
+				return Err(error);
 			}
 			return Ok(handle);
 		}
@@ -634,7 +661,7 @@ impl CoreServerlessRuntime {
 	/// outlive the request. Preserves terminal registration errors for the caller.
 	async fn stop_failed_envoy(&self, handle: &EnvoyHandle, reason: String) -> anyhow::Error {
 		handle.shutdown(true);
-		if timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.wait_stopped())
+		if timeout(FAILED_START_STOP_TIMEOUT, handle.wait_stopped())
 			.await
 			.is_err()
 		{

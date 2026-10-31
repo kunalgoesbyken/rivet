@@ -490,8 +490,9 @@ impl Sessions {
 		.await
 	}
 
-	/// Opens the actor's database volume for `generation` ahead of its first storage request, so
-	/// the open overlaps the start command's delivery and the runtime's own startup. The first
+	/// Reserves the actor's lane now and returns the volume open to spawn before forwarding its
+	/// start. Resolving the lane before spawning lets stop retire even an unpolled prefetch;
+	/// the returned future never resolves a replacement lane. The first
 	/// SQLite or KV request takes the same lane and finds the volume open, or waits for this open
 	/// to finish. A stop retires the lane, which fences the volume and ends a pending open; a
 	/// failed open leaves the lane without a volume, so the first request opens it again and
@@ -502,50 +503,53 @@ impl Sessions {
 		id: Id,
 		generation: u32,
 		create_unix_ms: i64,
-	) {
+	) -> Result<impl std::future::Future<Output = ()> + Send + use<>> {
 		self.prefetch_on(
 			id,
 			generation,
 			create_unix_ms,
 			open_volume(client, id, create_unix_ms),
 		)
-		.await;
+		.await
 	}
 
 	/// [`Sessions::prefetch`] with the volume open injected, so tests can count opens.
-	async fn prefetch_on<F: std::future::Future<Output = Result<OpenVolume>>>(
+	async fn prefetch_on<F, O>(
 		&self,
 		id: Id,
 		generation: u32,
 		create_unix_ms: i64,
-		open: impl FnOnce(Arc<dyn Fn() -> bool + Send + Sync>) -> F,
-	) {
-		#[allow(
-			clippy::disallowed_methods,
-			reason = "slow-open logging uses real time"
-		)]
-		let started = std::time::Instant::now();
-		let result = async {
-			let lane = self.lane(id).await?;
-			self.prepare(&lane, generation, create_unix_ms, open)
+		open: O,
+	) -> Result<impl std::future::Future<Output = ()> + use<F, O>>
+	where
+		F: std::future::Future<Output = Result<OpenVolume>>,
+		O: FnOnce(Arc<dyn Fn() -> bool + Send + Sync>) -> F,
+	{
+		let lane = self.lane(id).await?;
+		Ok(async move {
+			#[allow(
+				clippy::disallowed_methods,
+				reason = "slow-open logging uses real time"
+			)]
+			let started = std::time::Instant::now();
+			let result = Self::prepare(&lane, generation, create_unix_ms, open)
 				.await
-				.map(|_| ())
-		}
-		.await;
-		let elapsed = started.elapsed();
-		// The start's first storage request waits behind this open, so a slow one stalls it.
-		if elapsed >= std::time::Duration::from_secs(5) {
-			tracing::warn!(
-				%id,
-				generation,
-				elapsed_ms = elapsed.as_millis() as u64,
-				ok = result.is_ok(),
-				"slow actor database volume prefetch; the start's first storage request waits for it"
-			);
-		}
-		if let Err(error) = result {
-			tracing::debug!(%id, generation, ?error, "actor database volume prefetch failed; the first storage request opens it");
-		}
+				.map(|_| ());
+			let elapsed = started.elapsed();
+			// The start's first storage request waits behind this open, so a slow one stalls it.
+			if elapsed >= std::time::Duration::from_secs(5) {
+				tracing::warn!(
+					%id,
+					generation,
+					elapsed_ms = elapsed.as_millis() as u64,
+					ok = result.is_ok(),
+					"slow actor database volume prefetch; the start's first storage request waits for it"
+				);
+			}
+			if let Err(error) = result {
+				tracing::debug!(%id, generation, ?error, "actor database volume prefetch failed; the first storage request opens it");
+			}
+		})
 	}
 
 	/// Runs one actor KV request on the actor's database volume.
@@ -579,9 +583,7 @@ impl Sessions {
 		open: impl FnOnce(Arc<dyn Fn() -> bool + Send + Sync>) -> F,
 	) -> Result<p::KvResponseData> {
 		let lane = self.lane(id).await?;
-		let (_actor, mut pages) = self
-			.prepare(&lane, generation, create_unix_ms, open)
-			.await?;
+		let (_actor, mut pages) = Self::prepare(&lane, generation, create_unix_ms, open).await?;
 		let ino = pages.kv_ino().await?;
 		let fs = pages.fs()?.clone();
 		let result = crate::kv::execute(env.as_ref(), &fs, ino, data).await;
@@ -623,7 +625,13 @@ impl Sessions {
 			});
 		if reserved.is_err() {
 			tracing::warn!(capacity = self.capacity, "sqlite session capacity reached");
-			anyhow::bail!("SQLite session capacity reached");
+			// No lane was reserved and no storage operation ran. Keep this refusal typed so
+			// the SQLite reply carries a retry hint instead of a generic storage error.
+			return Err(depot_client::Overloaded {
+				reason: "sqlite_session_capacity".into(),
+				retry_after_ms: 100,
+			}
+			.build());
 		}
 		Ok(())
 	}
@@ -645,7 +653,6 @@ impl Sessions {
 	/// Takes the lane for `generation` of the incarnation `create_unix_ms` and makes sure its
 	/// database volume is open.
 	async fn prepare<F: std::future::Future<Output = Result<OpenVolume>>>(
-		&self,
 		lane: &Arc<Lane>,
 		generation: u32,
 		create_unix_ms: i64,
@@ -736,7 +743,7 @@ impl Sessions {
             actor_id = %id, generation, create_unix_ms);
 		trace_scope::scope(span, async {
 			let (mut actor, mut pages) =
-				self.prepare(lane, generation, create_unix_ms, open).await?;
+				Self::prepare(lane, generation, create_unix_ms, open).await?;
 			if pages.database.is_none() {
 				pages.database().await?;
 			}

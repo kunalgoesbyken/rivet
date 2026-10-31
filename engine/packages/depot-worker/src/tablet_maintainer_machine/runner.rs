@@ -754,8 +754,13 @@ impl Maintainer {
 				completion.finish(&());
 				// Publish the handle before the response reaches the core, so a query the
 				// core dispatches after observing an open store finds it open.
-				filesystem
-					.send_replace(storage.as_ref().map(|store| store.filesystem.clone()));
+				let opened = !matches!(
+					event,
+					Some(MaintainerEvent::OpenColdResponse { result: Err(_), .. })
+				);
+				filesystem.send_replace(
+					storage.as_ref().filter(|_| opened).map(|store| store.filesystem.clone()),
+				);
 				// The open store reports its memtable budget until it is dropped.
 				if let (Some(MaintainerEvent::OpenColdResponse { result: Ok(_), .. }), Some(store)) =
 					(&event, storage.as_ref())
@@ -3047,6 +3052,10 @@ async fn store_io(
 					)
 					.await?,
 				);
+				// The database already owns background tasks. Retain it before any
+				// fallible initialization so an error or panic still reaches the store
+				// loop's joined close instead of dropping a live writer.
+				*storage = Some(store.clone());
 				let log_key = crate::tablet_maintainer_machine::state::maintainer_log::log_key(
 					tablet.id,
 					tablet.hash_range.start,
@@ -3063,7 +3072,6 @@ async fn store_io(
 						.as_ref()
 						.map_or(&[][..], |record| record.version_marks.as_slice()),
 				);
-				*storage = Some(store);
 				Ok::<_, anyhow::Error>(record)
 			}
 			.await;
@@ -3077,6 +3085,7 @@ async fn store_io(
 				grant_epoch,
 				open_cold_ms = ended.saturating_sub(began),
 				ok = result.is_ok(),
+				error = ?result.as_ref().err(),
 				"tablet cold store opened"
 			);
 			Some(MaintainerEvent::OpenColdResponse {
@@ -3327,6 +3336,8 @@ fn open_reply_label(response: &ClientResponse) -> &'static str {
 		| ClientResponse::RepairAuditPage(_) => "unexpected",
 	}
 }
+
+
 
 
 

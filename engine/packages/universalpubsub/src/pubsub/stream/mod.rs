@@ -494,7 +494,7 @@ impl PubSub {
 					crate::metrics::REQUEST_QUEUE_REJECTED_TOTAL.inc();
 					crate::metrics::overloaded("request_pending", Some(class.as_str()))
 				}
-				mpsc::error::TrySendError::Closed(_) => errors::NoResponders.build(),
+				mpsc::error::TrySendError::Closed(_) => errors::ConsumerClosed.build(),
 			})?;
 		let control = StreamControl::new(self, deadline, Some(active), None);
 		let (sender, response) =
@@ -535,18 +535,14 @@ pub struct StreamSubscriber {
 }
 
 impl StreamSubscriber {
-	/// Withdraws this exact subscription while retaining streams already accepted.
+	/// Closes admission while retaining streams already accepted. The registration stays
+	/// until Drop, so new attempts receive `consumer_closed` while its owner drains.
+	/// Only an absent registration returns `no_responders`.
 	/// Dispatch reserves and queues under this same lock, so no accepted stream
 	/// can arrive after the receiver has drained. A replacement is unaffected.
 	pub fn close(&mut self) {
 		if let Some(inner) = self.inner.upgrade() {
-			let mut subscriptions = inner.subscriptions.lock();
-			if subscriptions
-				.get(&self.subject)
-				.is_some_and(|r| r.id == self.id)
-			{
-				subscriptions.remove(&self.subject);
-			}
+			let _subscriptions = inner.subscriptions.lock();
 			self.rx.close();
 		} else {
 			self.rx.close();

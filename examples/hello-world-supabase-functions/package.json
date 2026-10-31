@@ -4,7 +4,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "supabase functions serve",
+		"dev": "npx @rivetkit/cli dev --provider supabase",
 		"client": "tsx scripts/client.ts",
 		"check-types": "tsc --noEmit",
 		"deploy": "npx supabase functions deploy rivet"

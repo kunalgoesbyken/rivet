@@ -13,6 +13,8 @@ pub mod http;
 pub mod kv;
 pub mod latency_channel;
 pub mod metrics;
+#[doc(hidden)]
+pub mod shutdown_machine;
 pub mod sqlite;
 pub mod stringify;
 pub(crate) mod time {

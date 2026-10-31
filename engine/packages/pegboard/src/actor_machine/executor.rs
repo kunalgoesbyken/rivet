@@ -700,10 +700,9 @@ pub(crate) fn envoy_gone(
 	read_unix_ms > gone_after_unix_ms
 }
 
-/// Whether a UPS request failed because the worker that answered has no consumer for the
-/// subject: for an envoy connection's subject, the connection's task has ended and its socket
-/// is closed.
-fn no_responders(error: &anyhow::Error) -> bool {
+/// Whether the peer has no registration for this connection. A live connection
+/// draining accepted work retains its registration and returns consumer_closed.
+pub fn no_responders(error: &anyhow::Error) -> bool {
 	let structured = rivet_error::RivetError::extract(error);
 	structured.group() == "ups" && structured.code() == "no_responders"
 }

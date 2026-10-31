@@ -17,6 +17,18 @@ pub struct SharedActorEntry {
 	pub active_http_request_count: Arc<AsyncCounter>,
 }
 
+/// Latched transport termination outcome, published only after loop cleanup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StopStatus {
+	/// The loop is still running or draining; no termination outcome is published.
+	#[default]
+	Running,
+	/// All accepted generations finished locally and their events were acknowledged.
+	Acknowledged,
+	/// A deadline, explicit immediate stop, eviction, or terminal error ended the loop.
+	Interrupted,
+}
+
 pub struct SharedContext {
 	pub config: EnvoyConfig,
 	pub envoy_key: String,
@@ -51,10 +63,10 @@ pub struct SharedContext {
 	/// the first one.
 	pub last_contact_ms: AtomicI64,
 	// Latched signal fired by `envoy_loop` after its cleanup block completes.
-	// Waiters observing `true` are guaranteed that the loop has exited and
+	// Waiters observing a terminal outcome know that the loop has exited and
 	// every pending KV/SQLite request has been resolved (with `EnvoyShutdownError`
 	// if it didn't complete naturally).
-	pub stopped_tx: watch::Sender<bool>,
+	pub stopped_tx: watch::Sender<StopStatus>,
 }
 
 #[derive(Debug)]

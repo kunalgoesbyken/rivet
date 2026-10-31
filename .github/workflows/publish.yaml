@@ -17,8 +17,8 @@
 #                                       paths use `{sha}-release` so they never overwrite the
 #                                       debug preview of the same commit
 #
-# Selective preview builds: the `targets` input (all | rivetkit | engine)
-# narrows a preview to one target family so unrelated builds are
+# Selective preview builds: the `targets` input (all | rivetkit | engine |
+# cli) narrows a preview to one target family so unrelated builds are
 # skipped. The `context` job resolves it into `build_targets` / `build_wasm` /
 # `build_docker` outputs that gate the matrix and jobs. Skipped npm families have
 # their inbound dependency (rivetkit-family → @rivetkit/engine-cli) repinned to the
@@ -50,6 +50,7 @@ on:
           - all
           - rivetkit
           - engine
+          - cli
       preview_name:
         description: "Preview only: custom name for the version label + npm dist-tag (default: sanitized branch). Ignored on release."
         required: false
@@ -176,6 +177,33 @@ jobs:
             docker: docker/build/darwin-arm64.Dockerfile
             artifact: rivet-engine-aarch64-apple-darwin
             upload_prefix: engine
+            platform: darwin-arm64
+          # Rivet Cloud CLI: musl Linux and darwin platforms. The publish
+          # job also places the matching rivet-engine artifact next to the CLI
+          # binary so `rivet dev` works from the npm package.
+          - name: cli (linux-x64-musl)
+            build_target: cli
+            docker: docker/build/linux-x64-musl.Dockerfile
+            artifact: rivet-x86_64-unknown-linux-musl
+            upload_prefix: cli
+            platform: linux-x64-musl
+          - name: cli (linux-arm64-musl)
+            build_target: cli
+            docker: docker/build/linux-arm64-musl.Dockerfile
+            artifact: rivet-aarch64-unknown-linux-musl
+            upload_prefix: cli
+            platform: linux-arm64-musl
+          - name: cli (darwin-x64)
+            build_target: cli
+            docker: docker/build/darwin-x64.Dockerfile
+            artifact: rivet-x86_64-apple-darwin
+            upload_prefix: cli
+            platform: darwin-x64
+          - name: cli (darwin-arm64)
+            build_target: cli
+            docker: docker/build/darwin-arm64.Dockerfile
+            artifact: rivet-aarch64-apple-darwin
+            upload_prefix: cli
             platform: darwin-arm64
     runs-on: depot-ubuntu-24.04-8
     permissions:
@@ -382,12 +410,21 @@ jobs:
           path: native-artifacts
           pattern: native-*
           merge-multiple: true
+      # Engine binaries are also needed by the `cli` group (bundled into CLI
+      # platform packages), so key this off build_targets, not the group.
       - name: Download engine artifacts
         if: contains(needs.context.outputs.build_targets, 'engine')
         uses: actions/download-artifact@v4
         with:
           path: engine-artifacts
           pattern: engine-*
+          merge-multiple: true
+      - name: Download CLI artifacts
+        if: contains(needs.context.outputs.targets, 'cli')
+        uses: actions/download-artifact@v4
+        with:
+          path: cli-artifacts
+          pattern: cli-*
           merge-multiple: true
       - name: Download wasm package artifact
         if: needs.context.outputs.build_wasm == 'true'
@@ -411,6 +448,60 @@ jobs:
       - name: Place engine binaries in engine-cli platform packages
         if: contains(needs.context.outputs.targets, 'engine')
         run: bash scripts/publish/stage-engine-packages.sh engine-artifacts
+
+      - name: Place CLI binaries in CLI platform packages
+        run: |
+          CLI_DIR=rivetkit-typescript/packages/cli/npm
+          declare -A TRIPLE_TO_PLATFORM=(
+            [rivet-x86_64-unknown-linux-musl]=linux-x64-musl
+            [rivet-aarch64-unknown-linux-musl]=linux-arm64-musl
+            [rivet-x86_64-apple-darwin]=darwin-x64
+            [rivet-aarch64-apple-darwin]=darwin-arm64
+          )
+          for f in cli-artifacts/rivet-*; do
+            [ -e "$f" ] || continue
+            filename=$(basename "$f")
+            platform="${TRIPLE_TO_PLATFORM[$filename]:-}"
+            if [ -z "$platform" ]; then
+              echo "Skipping CLI artifact not mapped to a platform package: $filename"
+              continue
+            fi
+            dest="${CLI_DIR}/${platform}"
+            if [ ! -d "$dest" ]; then
+              echo "Missing CLI platform dir: $dest" >&2
+              exit 1
+            fi
+            cp "$f" "$dest/rivet"
+            chmod +x "$dest/rivet"
+            echo "Placed $filename -> npm/${platform}/rivet"
+          done
+
+      - name: Place bundled engine in CLI platform packages
+        run: |
+          CLI_DIR=rivetkit-typescript/packages/cli/npm
+          declare -A ENGINE_TO_PLATFORM=(
+            [rivet-engine-x86_64-unknown-linux-musl]=linux-x64-musl
+            [rivet-engine-aarch64-unknown-linux-musl]=linux-arm64-musl
+            [rivet-engine-x86_64-apple-darwin]=darwin-x64
+            [rivet-engine-aarch64-apple-darwin]=darwin-arm64
+          )
+          for f in engine-artifacts/rivet-engine-*; do
+            [ -e "$f" ] || continue
+            filename=$(basename "$f")
+            platform="${ENGINE_TO_PLATFORM[$filename]:-}"
+            if [ -z "$platform" ]; then
+              echo "Skipping engine artifact not mapped to a CLI platform package: $filename"
+              continue
+            fi
+            dest="${CLI_DIR}/${platform}"
+            if [ ! -d "$dest" ]; then
+              echo "Missing CLI platform dir: $dest" >&2
+              exit 1
+            fi
+            cp "$f" "$dest/rivet-engine"
+            chmod +x "$dest/rivet-engine"
+            echo "Placed $filename -> npm/${platform}/rivet-engine"
+          done
 
       - name: Bump package versions for build
         run: |

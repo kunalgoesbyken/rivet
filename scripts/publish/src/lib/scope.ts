@@ -9,23 +9,27 @@
  */
 
 /** User-facing target groups selected via the `targets` workflow_dispatch input. */
-export type TargetGroup = "rivetkit" | "engine";
+export type TargetGroup = "rivetkit" | "engine" | "cli";
 
 /** Native artifacts produced by the `build` matrix (matrix `build_target`). */
-export type BuildTarget = "rivetkit-napi" | "engine";
+export type BuildTarget = "rivetkit-napi" | "engine" | "cli";
 
 /** npm package families. */
-export type PackageFamily = "rivetkit" | "engine";
+export type PackageFamily = "rivetkit" | "engine" | "cli";
 
 export const ALL_GROUPS: readonly TargetGroup[] = [
 	"rivetkit",
 	"engine",
+	"cli",
 ];
 
 /** Classify a publishable package into its family by name. */
 export function packageFamily(name: string): PackageFamily {
 	if (name === "@rivetkit/engine-cli" || name.startsWith("@rivetkit/engine-cli-")) {
 		return "engine";
+	}
+	if (name === "@rivetkit/cli" || name.startsWith("@rivetkit/cli-")) {
+		return "cli";
 	}
 	// Everything else (rivetkit, @rivetkit/rivetkit-napi[-*], wasm, react,
 	// engine SDK + shared TS packages) is part of the rivetkit family.
@@ -66,6 +70,7 @@ export function scopedFamilies(
 	const families = new Set<PackageFamily>();
 	if (groups.includes("rivetkit")) families.add("rivetkit");
 	if (groups.includes("engine")) families.add("engine");
+	if (groups.includes("cli")) families.add("cli");
 	return families;
 }
 
@@ -81,6 +86,10 @@ export interface BuildScope {
 /**
  * Resolve which native builds a set of groups requires.
  *
+ * `cli` implies an `engine` build because the CLI platform packages bundle the
+ * rivet-engine binary via a file copy at publish time. That does not put the
+ * `engine` npm family in publish scope; it only ensures the binary artifact
+ * exists to copy.
  */
 export function buildScope(groups: readonly TargetGroup[]): BuildScope {
 	const targets = new Set<BuildTarget>();
@@ -93,6 +102,10 @@ export function buildScope(groups: readonly TargetGroup[]): BuildScope {
 	if (groups.includes("engine")) {
 		targets.add("engine");
 		buildDocker = true;
+	}
+	if (groups.includes("cli")) {
+		targets.add("cli");
+		targets.add("engine");
 	}
 	return { buildTargets: [...targets], buildWasm, buildDocker };
 }

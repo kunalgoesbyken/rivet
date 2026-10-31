@@ -60,14 +60,26 @@ pub(crate) async fn reserve(
 	// Reservations are immutable. An existing key can be recreated under its original
 	// reservation without proposing another conditional write. A missing read still takes
 	// the compare-and-set path below, which resolves concurrent first reservations.
-	if let Some(existing) = get(ctx, &namespace, &name, &key).await? {
-		return Ok(if existing == reservation_id {
-			ReserveResult::Reserved {}
-		} else {
-			ReserveResult::AlreadyReserved {
-				reservation_id: existing,
-			}
-		});
+	match get(ctx, &namespace, &name, &key).await {
+		Ok(Some(existing)) => {
+			return Ok(if existing == reservation_id {
+				ReserveResult::Reserved {}
+			} else {
+				ReserveResult::AlreadyReserved {
+					reservation_id: existing,
+				}
+			});
+		}
+		Ok(None) => {}
+		Err(error) if depot_client::retry_after_ms(&error).is_some() => {
+			// An interrupted creating write can leave the volume unreadable until a writer
+			// reconciles it. The conditional proposal below preserves any existing winner.
+			tracing::debug!(
+				?error,
+				"reservation read refused; reconciling with a conditional write"
+			);
+		}
+		Err(error) => return Err(error),
 	}
 
 	let epoxy_key = ActorKeyKey::new(namespace, name, key);

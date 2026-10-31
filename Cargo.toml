@@ -17,6 +17,7 @@ members = [
 #   "engine/packages/cache",
 #   "engine/packages/cache-purge",
 #   "engine/packages/cache-result",
+  "engine/packages/cli",
   "engine/packages/config",
   "engine/packages/cluster-config",
   "engine/packages/config-schema-gen",
@@ -135,6 +136,7 @@ members = [
   num-bigint = { version = "0.4", features = ["serde"] }
   libc = "0.2"
   lz4_flex = "0.11.3"
+  md5 = "0.7.0"
   object_store = { version = "=0.14.2", default-features = false }
   parking_lot = "0.12"
   portpicker = "0.1"
@@ -410,6 +412,9 @@ members = [
 
     [workspace.dependencies.rivet-cache-result]
     path = "engine/packages/cache-result"
+
+    [workspace.dependencies.rivet-cli]
+    path = "engine/packages/cli"
 
     [workspace.dependencies.rivet-config]
     path = "engine/packages/config"
@@ -687,3 +692,4 @@ codegen-units = 256    # max parallelism
 [patch.crates-io]
 slatedb = { path = "vendor/slatedb/out" }
 object_store = { path = "vendor/object_store/out" }
+
