@@ -21,6 +21,7 @@ import { $ } from "execa";
 import { glob } from "glob";
 import * as semver from "semver";
 import { scoped } from "./logger.js";
+import { OSS_REPOSITORY } from "./repository.js";
 import {
 	buildMetaPlatformMap,
 	discoverPackages,
@@ -531,16 +532,21 @@ export async function bumpExampleLockfile(
 // Local semver helpers — used only by `cut-release.ts`.
 // -----------------------------------------------------------------------------
 
+/** Release tags live on the OSS repository, so read them from there instead of a local clone. */
 async function getAllGitVersions(): Promise<string[]> {
+	let stdout: string;
 	try {
-		await $`git fetch --tags --force --quiet`;
+		({ stdout } = await $`git ls-remote --tags --refs https://github.com/${OSS_REPOSITORY}.git refs/tags/v*`);
 	} catch {
 		throw new Error(
-			"could not fetch git tags — refusing to compute latest flag from stale local tags",
+			"could not list OSS release tags — refusing to compute the latest flag without them",
 		);
 	}
-	const result = await $`git tag -l v*`;
-	const tags = result.stdout.trim().split("\n").filter(Boolean);
+	const tags = stdout
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => line.split("refs/tags/")[1] ?? "");
 	if (tags.length === 0) return [];
 	return tags
 		.map((tag) => tag.replace(/^v/, ""))

@@ -964,7 +964,7 @@ importers:
         version: link:../../rivetkit-typescript/packages/rivetkit-napi
       '@rivetkit/sql-loader':
         specifier: '*'
-        version: 2.2.1
+        version: link:../../rivetkit-typescript/packages/sql-loader
       ai:
         specifier: ^4.0.38
         version: 4.3.19(react@19.1.0)(zod@3.25.76)
@@ -4971,36 +4971,15 @@ packages:
     cpu: [x64]
     os: [linux]
 
-  '@rivetkit/framework-base@2.3.31':
-    resolution: {integrity: sha512-qEw5P4QcMO+ZGJ99Azjc8teTwirPNGA9RI9DQFAPN0wAbIStKfwTFwE5UeIt820g3FpWRNxzdMzEshab8nEy/w==}
-
-  '@rivetkit/framework-base@3.0.0-preview.4':
-    resolution: {integrity: sha512-iQwAZb+G9sJhBgd5fF5QYCpWE/SFeUJyVwwK8d542lXJGMZYVzKpDcg7hUPL0iAbPrEG6jhNmchsZ+rg5CUHJg==}
-
   '@rivetkit/on-change@6.0.1':
     resolution: {integrity: sha512-QBN/KRBXLJdCgN4gBTL3XAc/zKm58atSnieXWMOyFSPmo6F1/yIVV/LTRdvAktfCttrGx7W6c32i/lwqCHWnsQ==}
     engines: {node: '>=20'}
-
-  '@rivetkit/react@2.3.31':
-    resolution: {integrity: sha512-WGYxzlUIPyasNE878d2o3htPcIMJ/gvoNFTsiJ/30oto+s2n8B8TDduHOrtnkKCfgWJGr5npBC7CbngunhE4+w==}
-    peerDependencies:
-      react: 19.1.0
-      react-dom: 19.1.0
-
-  '@rivetkit/react@3.0.0-preview.4':
-    resolution: {integrity: sha512-SCYu9XhUVRg9kcZAVIArGb//+4dFHVQjl6qrYqzuGXqAh00KrbUR4h4orgikJ7nb5AAhIrSxuoUaDp4YFVngaw==}
-    peerDependencies:
-      react: 19.1.0
-      react-dom: 19.1.0
 
   '@rivetkit/rivetkit-napi-linux-x64-gnu@2.3.5':
     resolution: {integrity: sha512-KZxr4zTFEG5UokI7foz+X+lBvzyUh+D1LccPSjNS9By8RJgh+PdROfEimlwUIOr9SAf5RQHXuTccYLzUWgdCBQ==}
     engines: {node: '>= 20.0.0'}
     cpu: [x64]
     os: [linux]
-
-  '@rivetkit/sql-loader@2.2.1':
-    resolution: {integrity: sha512-qqykzDGak06VY58o8qh8TH7CL77vIp2FHUJB2ZT78LJ+muRrXiwj/QHeVn9ykWePqCYCD9XP0L6Qd2fmERdXqQ==}
 
   '@rolldown/binding-android-arm64@1.2.1':
     resolution: {integrity: sha512-02hOeOSryYxVrOIphmLAsqnCJWxwlzFk+pEt/N/i6OgT3lShHO7xGCU5cpgchRDHboAEbSjzgGh+O/u1GswQmA==}
@@ -14122,39 +14101,9 @@ snapshots:
 
   '@rivetkit/engine-cli-linux-x64-musl@2.3.5': {}
 
-  '@rivetkit/framework-base@2.3.31':
-    dependencies:
-      '@tanstack/store': 0.7.5
-      fast-deep-equal: 3.1.3
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
-  '@rivetkit/framework-base@3.0.0-preview.4':
-    dependencies:
-      '@tanstack/store': 0.7.5
-      fast-deep-equal: 3.1.3
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
   '@rivetkit/on-change@6.0.1': {}
 
-  '@rivetkit/react@2.3.31(react-dom@19.1.0(react@19.1.0))(react@19.1.0)':
-    dependencies:
-      '@rivetkit/framework-base': 2.3.31
-      '@tanstack/react-store': 0.7.5(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
-      react: 19.1.0
-      react-dom: 19.1.0(react@19.1.0)
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
-  '@rivetkit/react@3.0.0-preview.4(react-dom@19.1.0(react@19.1.0))(react@19.1.0)':
-    dependencies:
-      '@rivetkit/framework-base': 3.0.0-preview.4
-      '@tanstack/react-store': 0.7.5(react-dom@19.1.0(react@19.1.0))(react@19.1.0)
-      react: 19.1.0
-      react-dom: 19.1.0(react@19.1.0)
-      rivetkit: link:rivetkit-typescript/packages/rivetkit
-
   '@rivetkit/rivetkit-napi-linux-x64-gnu@2.3.5': {}
-
-  '@rivetkit/sql-loader@2.2.1': {}
 
   '@rolldown/binding-android-arm64@1.2.1':
     optional: true

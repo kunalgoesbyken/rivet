@@ -2,10 +2,18 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "execa";
 
-/** The local counterpart of publish.yaml's rivet-dev/rivet repository-ID guard. */
-export function isOssRepositoryRemote(remote: string): boolean {
+/** The public repository that publish.yaml runs in and that release tags live on. */
+export const OSS_REPOSITORY = "rivet-dev/rivet";
+
+/** The private repository that is the source of truth for every release. */
+export const EE_REPOSITORY = "rivet-dev/engine-ee";
+
+/** Whether `remote` is a plain GitHub URL for `repository`, in any common Git URL form. */
+export function isGitHubRemote(remote: string, repository: string): boolean {
 	const value = remote.trim();
-	if (/^git@github\.com:rivet-dev\/rivet(?:\.git)?$/.test(value)) return true;
+	const [owner, name] = repository.split("/");
+	const path = new RegExp(`^/${owner}/${name}(?:\\.git)?/?$`);
+	if (new RegExp(`^git@github\\.com:${owner}/${name}(?:\\.git)?$`).test(value)) return true;
 	try {
 		const url = new URL(value);
 		return (
@@ -14,7 +22,7 @@ export function isOssRepositoryRemote(remote: string): boolean {
 			!url.port &&
 			!url.password &&
 			(url.username === "" || (url.protocol === "ssh:" && url.username === "git")) &&
-			/^\/rivet-dev\/rivet(?:\.git)?\/?$/.test(url.pathname) &&
+			path.test(url.pathname) &&
 			!url.search &&
 			!url.hash
 		);
@@ -38,14 +46,18 @@ export async function originRemoteUrl(repoRoot: string): Promise<string> {
 	} catch {
 		// Report the same clear error for missing Git, jj, and origin remotes.
 	}
-	throw new Error("release requires an origin remote for github.com/rivet-dev/rivet");
+	throw new Error(`release requires an origin remote for github.com/${EE_REPOSITORY}`);
 }
 
-export async function requireOssReleaseRepository(repoRoot: string): Promise<void> {
+/**
+ * Releases are cut from EE, which publishes to OSS through the snapshot sync. Running the
+ * release from an OSS checkout would commit to OSS directly and fork it from EE.
+ */
+export async function requireEeReleaseRepository(repoRoot: string): Promise<void> {
 	const origin = await originRemoteUrl(repoRoot);
-	if (!isOssRepositoryRemote(origin)) {
+	if (!isGitHubRemote(origin, EE_REPOSITORY)) {
 		throw new Error(
-			`release is only allowed from github.com/rivet-dev/rivet (repository ID 654560183); origin is ${origin}`,
+			`release is only allowed from a github.com/${EE_REPOSITORY} jj workspace; origin is ${origin}`,
 		);
 	}
 }
