@@ -498,5 +498,3 @@ async fn wait_for_handler_metadata(handler_url: &str) -> Result<()> {
 		tokio::time::sleep(HANDLER_METADATA_RETRY).await;
 	}
 }
-
-

@@ -200,5 +200,3 @@ fn is_local_engine_endpoint(endpoint: &str) -> bool {
 		.map(|ip| ip.is_loopback() || ip.is_unspecified())
 		.unwrap_or(false)
 }
-
-
