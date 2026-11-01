@@ -4997,6 +4997,7 @@ version = "3.0.0-preview.5"
 dependencies = [
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

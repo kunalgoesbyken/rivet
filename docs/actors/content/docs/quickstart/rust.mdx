@@ -163,7 +163,7 @@ use rivetkit::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	let client = Client::new(ClientConfig::new("http://localhost:6420").namespace("default"));
+	let client = Client::new(ClientConfig::new("http://localhost:6420"));
 
 	let counter = client.get_or_create_typed_default::<Counter>("counter", ["my-counter"])?;
 	let count = counter.send(Increment { amount: 3 }).await?;
