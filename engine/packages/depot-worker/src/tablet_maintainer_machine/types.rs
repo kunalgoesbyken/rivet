@@ -375,7 +375,7 @@ impl Default for MaintainerConfig {
 impl MaintainerConfig {
 	/// The maintainer's fixed bounds and intervals.
 	pub fn tuning(&self) -> &MaintainerTuning {
-		{ &MaintainerTuning::PRODUCTION }
+		&MaintainerTuning::PRODUCTION
 	}
 }
 
